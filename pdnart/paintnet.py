@@ -6,7 +6,7 @@ paint.net has no scripting API, so this uses two things it does support well:
 * its keyboard shortcuts:
     Ctrl+Alt+V   Edit > Paste into New Image
     Ctrl+Shift+V Edit > Paste into New Layer
-    F4           Layer Properties (used to name each layer)
+    F4           Layer Properties (used to name each layer and set its blend mode)
     Ctrl+Shift+S Save As
 
 Each scene layer is rendered at full canvas size and pasted as its own paint.net
@@ -31,6 +31,10 @@ from .render import apply_opacity, background_image, render_layers
 from .scene import Scene
 
 TITLE_RE = r".*paint\.net.*"
+
+# Our blend mode names -> the names in paint.net's Layer Properties dropdown.
+PDN_BLEND_NAMES = {"multiply": "Multiply", "screen": "Screen", "overlay": "Overlay", "darken": "Darken",
+                   "lighten": "Lighten", "additive": "Additive", "difference": "Difference"}
 
 CANDIDATE_EXES = [
     os.environ.get("PDN_EXE", ""),
@@ -127,23 +131,43 @@ class PaintDotNet:
         self._commit_paste()
         self.keys("^b")  # Zoom to window, so later pastes land at (0, 0)
 
-    def paste_layer(self, img: Image.Image, name: str | None = None) -> None:
+    def paste_layer(self, img: Image.Image, name: str | None = None, blend: str = "normal") -> bool:
         copy_image_to_clipboard(img)
         self.keys("^+v")  # Paste into New Layer
         self._commit_paste()
-        if name:
-            self.rename_current_layer(name)
+        return self.set_layer_properties(name, blend)
 
-    def rename_current_layer(self, name: str) -> None:
+    def set_layer_properties(self, name: str | None = None, blend: str = "normal") -> bool:
+        """Set the current layer's name and blend mode via Layer Properties (F4).
+
+        Returns False if the blend mode could not be set (the name is best-effort either way).
+        """
+        if not name and blend == "normal":
+            return True
         self.keys("{F4}")
+        blend_ok = blend == "normal"
         try:
             dlg = self.app.window(title_re=r".*Layer Properties.*")
             dlg.wait("visible", timeout=5)
-            dlg.child_window(control_type="Edit", found_index=0).set_edit_text(name)
+            if name:
+                try:
+                    dlg.child_window(control_type="Edit", found_index=0).set_edit_text(name)
+                except Exception:
+                    pass
+            if blend != "normal":
+                try:
+                    dlg.child_window(control_type="ComboBox", found_index=0).select(PDN_BLEND_NAMES[blend])
+                    blend_ok = True
+                except Exception:
+                    pass
             dlg.child_window(title="OK", control_type="Button").click()
         except Exception:
-            self.keys("{ESC}")  # leave the layer unnamed rather than typing into the wrong field
+            self.keys("{ESC}")  # leave the layer as is rather than typing into the wrong field
         time.sleep(self.delay)
+        return blend_ok
+
+    def rename_current_layer(self, name: str) -> None:
+        self.set_layer_properties(name)
 
     def save_as(self, path: str | Path) -> None:
         """Save the document as a layered .pdn file."""
@@ -165,15 +189,19 @@ class PaintDotNet:
             send_keys(escaped + "{ENTER}", with_spaces=True)
         time.sleep(self.delay * 3)
 
-    def send_scene(self, scene: Scene, save_path: str | Path | None = None) -> None:
+    def send_scene(self, scene: Scene, save_path: str | Path | None = None) -> list[str]:
         """Recreate `scene` in paint.net: a Background layer plus one layer per visible scene layer.
 
-        Layer opacity is baked into the pasted pixels; hidden layers are skipped.
+        Layer opacity is baked into the pasted pixels; blend modes are set in Layer Properties.
+        Hidden layers are skipped. Returns warnings (e.g. a blend mode that could not be set).
         """
+        warnings = []
         self.new_image_from(background_image(scene))
         self.rename_current_layer("Background")
         for layer, img in render_layers(scene):
-            if layer.visible:
-                self.paste_layer(apply_opacity(img, layer.opacity), layer.name)
+            if layer.visible and not self.paste_layer(apply_opacity(img, layer.opacity), layer.name, layer.blend):
+                warnings.append(f"could not set blend mode {layer.blend!r} on layer {layer.name!r}; "
+                                "set it in Layer Properties (F4)")
         if save_path:
             self.save_as(save_path)
+        return warnings

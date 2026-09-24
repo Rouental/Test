@@ -1,20 +1,28 @@
-"""Render a Scene to Pillow images: one RGBA image per layer plus a composite.
+"""Render a Scene: each layer becomes a premultiplied float raster, then layers are blended.
 
-Shapes are drawn at SUPERSAMPLE x resolution and downscaled, which gives
-anti-aliased edges (Pillow's ImageDraw does not anti-alias on its own).
+Shapes are rasterised at SUPERSAMPLE x resolution for anti-aliasing. Brushes are
+anti-aliased by the dab engine itself (see brushes.py).
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
-import random
-from typing import Any
+import zlib
+from collections import OrderedDict
+from typing import Any, Callable
 
-from PIL import Image, ImageColor, ImageDraw, ImageFilter, ImageFont
+import numpy as np
+from PIL import Image, ImageColor, ImageDraw, ImageFont
 
+from .brushes import Brush, Paper, _stamp, make_brush, stroke_masks
+from .raster import composite_over, from_image, gblur, new_layer, paint, to_image
 from .scene import Layer, Scene, SceneError
 
-SUPERSAMPLE = 3
+SUPERSAMPLE = 4
+_CACHE: OrderedDict[str, np.ndarray] = OrderedDict()
+_CACHE_SIZE = 48
 
 
 def parse_color(c: Any) -> tuple[int, int, int, int]:
@@ -28,163 +36,309 @@ def parse_color(c: Any) -> tuple[int, int, int, int]:
             raise SceneError(f"color lists need 3 or 4 values, got {c!r}")
         return tuple(max(0, min(255, v)) for v in vals)  # type: ignore[return-value]
     try:
-        rgba = ImageColor.getcolor(str(c), "RGBA")
+        return ImageColor.getcolor(str(c), "RGBA")  # type: ignore[return-value]
     except ValueError as e:
         raise SceneError(f"bad color {c!r}") from e
-    return rgba  # type: ignore[return-value]
 
 
-def _catmull_rom(points: list[tuple[float, float]], steps: int = 12) -> list[tuple[float, float]]:
-    if len(points) < 3:
-        return points
-    pts = [points[0], *points, points[-1]]
-    out: list[tuple[float, float]] = []
-    for i in range(1, len(pts) - 2):
-        p0, p1, p2, p3 = pts[i - 1], pts[i], pts[i + 1], pts[i + 2]
+def rgba01(c: Any) -> tuple[float, float, float, float]:
+    return tuple(v / 255 for v in parse_color(c))  # type: ignore[return-value]
+
+
+def _catmull_rom_closed(pts: list, steps: int = 12) -> list[tuple[float, float]]:
+    n = len(pts)
+    out = []
+    for i in range(n):
+        p0, p1, p2, p3 = (np.asarray(pts[(i + k) % n][:2], float) for k in (-1, 0, 1, 2))
         for s in range(steps):
             t = s / steps
-            t2, t3 = t * t, t * t * t
-            out.append(
-                tuple(  # type: ignore[arg-type]
-                    0.5
-                    * (2 * p1[k] + (-p0[k] + p2[k]) * t + (2 * p0[k] - 5 * p1[k] + 4 * p2[k] - p3[k]) * t2
-                       + (-p0[k] + 3 * p1[k] - 3 * p2[k] + p3[k]) * t3)
-                    for k in (0, 1)
-                )
-            )
-    out.append(points[-1])
+            out.append(tuple(0.5 * (2 * p1 + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t
+                                    + (-p0 + 3 * p1 - 3 * p2 + p3) * t ** 3)))
     return out
 
 
 def _star(cx: float, cy: float, r: float) -> list[tuple[float, float]]:
-    pts = []
-    for i in range(10):
-        a = -math.pi / 2 + i * math.pi / 5
-        rr = r if i % 2 == 0 else r * 0.45
-        pts.append((cx + rr * math.cos(a), cy + rr * math.sin(a)))
-    return pts
+    return [(cx + (r if i % 2 == 0 else r * 0.45) * math.cos(-math.pi / 2 + i * math.pi / 5),
+             cy + (r if i % 2 == 0 else r * 0.45) * math.sin(-math.pi / 2 + i * math.pi / 5)) for i in range(10)]
 
 
-def _gradient(op: dict[str, Any], w: int, h: int) -> Image.Image:
-    stops = sorted(((float(o), parse_color(c)) for o, c in op["stops"]), key=lambda s: s[0])
+class LayerRenderer:
+    def __init__(self, w: int, h: int, paper: Paper):
+        self.w, self.h, self.paper = w, h, paper
+
+    # -- helpers -----------------------------------------------------------
+    def _raster(self, bbox, draw: Callable[[ImageDraw.ImageDraw, Callable], None], feather: float = 0):
+        """Rasterise `draw` inside bbox at supersampled resolution. Returns (mask, x0, y0) or None."""
+        pad = 2 + math.ceil(3 * feather)
+        x0 = max(0, math.floor(bbox[0]) - pad)
+        y0 = max(0, math.floor(bbox[1]) - pad)
+        x1 = min(self.w, math.ceil(bbox[2]) + pad)
+        y1 = min(self.h, math.ceil(bbox[3]) + pad)
+        if x0 >= x1 or y0 >= y1:
+            return None
+        s = SUPERSAMPLE
+        img = Image.new("L", ((x1 - x0) * s, (y1 - y0) * s))
+        draw(ImageDraw.Draw(img), lambda pts: [((x - x0) * s, (y - y0) * s) for x, y in pts])
+        mask = np.asarray(img.reduce(s), np.float32) / 255
+        if feather:
+            mask = gblur(mask, feather)
+        return mask, x0, y0
+
+    def _shape(self, layer, op, outline_pts, closed_poly=True, draw_fill=None):
+        """Fill and/or outline a closed shape given as a point list."""
+        opts = _paint_opts(op)
+        xs, ys = [p[0] for p in outline_pts], [p[1] for p in outline_pts]
+        width = float(op.get("width", 1))
+        bbox = (min(xs) - width, min(ys) - width, max(xs) + width, max(ys) + width)
+        feather = float(op.get("feather", 0))
+        if op.get("fill"):
+            res = self._raster(bbox, draw_fill or (lambda d, T: d.polygon(T(outline_pts), fill=255)), feather)
+            if res:
+                paint(layer, *res, rgba01(op["fill"]), **opts)
+        if op.get("stroke"):
+            ss = SUPERSAMPLE
+
+            def outline(d, T):
+                pts = T(outline_pts)
+                d.line([*pts, pts[0]] if closed_poly else pts, fill=255, width=max(1, round(width * ss)),
+                       joint="curve")
+            res = self._raster(bbox, outline, feather)
+            if res:
+                paint(layer, *res, rgba01(op["stroke"]), **opts)
+
+    def _brush_paths(self, layer, op, b: Brush, color, rng, lock_alpha=False, erase=False, opacity=1.0):
+        paths = op.get("paths") or [op["points"]]
+        for path in paths:
+            for mask, x0, y0, rgba in stroke_masks(path, b, color, rng, self.paper):
+                paint(layer, mask, x0, y0, rgba, lock_alpha=lock_alpha, erase=erase, opacity=opacity)
+
+    # -- ops ---------------------------------------------------------------
+    def render(self, layer_spec: Layer) -> np.ndarray:
+        layer = new_layer(self.w, self.h)
+        for i, op in enumerate(layer_spec.ops):
+            seed = op.get("seed", zlib.crc32(f"{layer_spec.name}:{i}".encode()))
+            rng = np.random.default_rng(seed)
+            try:
+                layer = self.apply(layer, op, rng)
+            except SceneError:
+                raise
+            except Exception as e:  # surface which op failed, e.g. a missing font file
+                raise SceneError(f"layer {layer_spec.name!r} op #{i} ({op['op']}): {e}") from e
+        return layer
+
+    def apply(self, layer: np.ndarray, op: dict[str, Any], rng: np.random.Generator) -> np.ndarray:
+        if op.get("clip") is None:
+            return self._apply(layer, op, rng)
+        # A clip works like a selection: whatever the op does is kept only inside it.
+        before = layer.copy()
+        after = self._apply(layer, op, rng)
+        cm = self.clip_mask(op["clip"])
+        return before + (after - before) * cm[..., None]
+
+    def clip_mask(self, clip: Any) -> np.ndarray:
+        spec = clip if isinstance(clip, dict) else {"points": clip}
+        pts = [tuple(p[:2]) for p in spec["points"]]
+        if spec.get("smooth"):
+            pts = _catmull_rom_closed(pts)
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        full = np.zeros((self.h, self.w), np.float32)
+        res = self._raster((min(xs), min(ys), max(xs), max(ys)), lambda d, T: d.polygon(T(pts), fill=255),
+                           float(spec.get("feather", 0)))
+        if res:
+            m, x0, y0 = res
+            full[y0:y0 + m.shape[0], x0:x0 + m.shape[1]] = m
+        if spec.get("invert"):
+            full = 1 - full
+        return full
+
+    def _apply(self, layer: np.ndarray, op: dict[str, Any], rng: np.random.Generator) -> np.ndarray:
+        kind = op["op"]
+        opts = _paint_opts(op)
+        W, H = self.w, self.h
+
+        if kind == "fill":
+            paint(layer, np.ones((H, W), np.float32), 0, 0, rgba01(op["color"]), **opts)
+        elif kind == "rect":
+            x, y, w, h = op["x"], op["y"], op["w"], op["h"]
+            corners = [(x, y), (x + w, y), (x + w, y + h), (x, y + h)]
+            radius = float(op.get("radius", 0))
+            fill = (lambda d, T: d.rounded_rectangle([*T([(x, y)])[0], *T([(x + w, y + h)])[0]],
+                                                     radius=radius * SUPERSAMPLE, fill=255)) if radius else None
+            self._shape(layer, op, corners, draw_fill=fill)
+        elif kind == "ellipse":
+            a = math.radians(op.get("angle", 0))
+            pts = [(op["cx"] + op["rx"] * math.cos(t) * math.cos(a) - op["ry"] * math.sin(t) * math.sin(a),
+                    op["cy"] + op["rx"] * math.cos(t) * math.sin(a) + op["ry"] * math.sin(t) * math.cos(a))
+                   for t in np.linspace(0, 2 * math.pi, 180, endpoint=False)]
+            self._shape(layer, op, pts)
+        elif kind == "polygon":
+            pts = [tuple(p[:2]) for p in op["points"]]
+            if op.get("smooth"):
+                pts = _catmull_rom_closed(pts)
+            self._shape(layer, op, pts)
+        elif kind == "brush":
+            b = make_brush(op.get("brush"), op)
+            self._brush_paths(layer, op, b, rgba01(op.get("color", "#000000")), rng,
+                              lock_alpha=opts["lock_alpha"], erase=opts["erase"])
+        elif kind in ("stroke", "line"):
+            b = make_brush("round", {"size": op.get("width", 1), "hardness": 1.0, "spacing": 0.1,
+                                     "smooth": kind == "stroke" and op.get("smooth", True)})
+            self._brush_paths(layer, op, b, rgba01(op.get("color", "#000000")), rng, **opts)
+        elif kind == "hatch":
+            self._hatch(layer, op, rng)
+        elif kind == "smudge":
+            self._smudge(layer, op, rng)
+        elif kind == "gradient":
+            paint(layer, np.ones((H, W), np.float32), 0, 0, _gradient(op, W, H), **opts)
+        elif kind == "scatter":
+            rx, ry, rw, rh = op.get("region", [0, 0, W, H])
+            rmin, rmax = op.get("radius", [1, 2])
+            colors = op.get("colors", ["#ffffff"])
+            n = int(op["count"])
+            xs, ys = rx + rng.random(n) * rw, ry + rng.random(n) * rh
+            rs = rng.uniform(rmin, rmax, n)
+            which = rng.integers(0, len(colors), n)
+            for ci, c in enumerate(colors):
+                sel = which == ci
+                if not sel.any():
+                    continue
+                if op.get("shape", "circle") == "star":
+                    res = self._raster((0, 0, W, H), lambda d, T: [d.polygon(T(_star(x, y, r)), fill=255)
+                                                                    for x, y, r in zip(xs[sel], ys[sel], rs[sel])])
+                    if res:
+                        paint(layer, *res, rgba01(c), **opts)
+                else:
+                    mask, x0, y0 = _stamp(xs[sel], ys[sel], rs[sel], np.ones(sel.sum()), 0.9, False)
+                    paint(layer, mask, x0, y0, rgba01(c), **opts)
+        elif kind == "text":
+            size = int(op.get("size", 24))
+            font = ImageFont.truetype(op["font"], size) if op.get("font") else ImageFont.load_default(size)
+            img = Image.new("L", (W, H))
+            ImageDraw.Draw(img).text((op["x"], op["y"]), str(op["text"]), fill=255, font=font,
+                                     anchor=op.get("anchor", "la"))
+            paint(layer, np.asarray(img, np.float32) / 255, 0, 0, rgba01(op.get("color", "#000000")), **opts)
+        elif kind == "image":
+            img = Image.open(op["path"]).convert("RGBA")
+            if "w" in op or "h" in op:
+                img = img.resize((int(op.get("w", img.width)), int(op.get("h", img.height))), Image.LANCZOS)
+            arr = np.asarray(img, np.float32) / 255
+            paint(layer, np.ones(arr.shape[:2], np.float32), int(op.get("x", 0)), int(op.get("y", 0)), arr, **opts)
+        elif kind == "blur":
+            layer = gblur(layer, float(op["radius"]))
+        return layer
+
+    def _hatch(self, layer, op, rng):
+        region = [tuple(p[:2]) for p in op["region"]]
+        xs, ys = [p[0] for p in region], [p[1] for p in region]
+        clip = self._raster((min(xs), min(ys), max(xs), max(ys)), lambda d, T: d.polygon(T(region), fill=255), 0.7)
+        if clip is None:
+            return
+        cmask, cx0, cy0 = clip
+        ch, cw = cmask.shape
+        b = make_brush(op.get("brush", "pencil"), op)
+        acc = np.zeros_like(cmask)
+        gap = float(op.get("gap", max(3.0, b.size * 2.5)))
+        angles = [op.get("angle", 45)] + ([op.get("angle", 45) + 90] if op.get("cross") else [])
+        mx, my = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+        half = math.hypot(max(xs) - min(xs), max(ys) - min(ys)) / 2 + 4
+        for ang in angles:
+            dx, dy = math.cos(math.radians(ang)), math.sin(math.radians(ang))
+            nx, ny = -dy, dx
+            o = -half
+            while o <= half:
+                cxl, cyl = mx + nx * o, my + ny * o
+                a, e = rng.uniform(-0.1, 0.05) * half, rng.uniform(-0.05, 0.1) * half
+                path = [[cxl - dx * (half + a), cyl - dy * (half + a), 0.6],
+                        [cxl, cyl, 1.0],
+                        [cxl + dx * (half + e), cyl + dy * (half + e), 0.6]]
+                for mask, x0, y0, _ in stroke_masks(path, b, (0, 0, 0, 1), rng, self.paper):
+                    # Merge into the region-sized accumulator.
+                    sx0, sy0 = max(x0, cx0), max(y0, cy0)
+                    sx1, sy1 = min(x0 + mask.shape[1], cx0 + cw), min(y0 + mask.shape[0], cy0 + ch)
+                    if sx0 < sx1 and sy0 < sy1:
+                        view = acc[sy0 - cy0:sy1 - cy0, sx0 - cx0:sx1 - cx0]
+                        np.maximum(view, mask[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0], out=view)
+                o += gap * rng.uniform(0.8, 1.2)
+        paint(layer, acc * cmask, cx0, cy0, rgba01(op.get("color", "#333333")), **_paint_opts(op))
+
+    def _smudge(self, layer, op, rng):
+        size = float(op.get("size", 20))
+        b = Brush(size=size, hardness=float(op.get("hardness", 0.2)), spacing=0.1, pressure_size=0.5,
+                  smooth=op.get("smooth", True))
+        strength = float(op.get("strength", 0.6))
+        sigma = max(1.0, size * 0.25)
+        pad = int(3 * sigma) + 2
+        for path in op.get("paths") or [op["points"]]:
+            for mask, x0, y0, _ in stroke_masks(path, b, (0, 0, 0, 1), rng):
+                h, w = mask.shape
+                rx0, ry0 = max(0, x0 - pad), max(0, y0 - pad)
+                rx1, ry1 = min(self.w, x0 + w + pad), min(self.h, y0 + h + pad)
+                if rx0 >= rx1 or ry0 >= ry1:
+                    continue
+                region = layer[ry0:ry1, rx0:rx1]
+                blurred = gblur(region, sigma)
+                m = np.zeros(region.shape[:2], np.float32)
+                sx0, sy0 = max(x0, rx0), max(y0, ry0)
+                sx1, sy1 = min(x0 + w, rx1), min(y0 + h, ry1)
+                m[sy0 - ry0:sy1 - ry0, sx0 - rx0:sx1 - rx0] = mask[sy0 - y0:sy1 - y0, sx0 - x0:sx1 - x0]
+                old_a = region[..., 3:4].copy()
+                region += (blurred - region) * (m * strength)[..., None]
+                if op.get("lock_alpha"):  # blend colors only; don't spread paint past its edges
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        straight = np.where(region[..., 3:4] > 1e-6, region[..., :3] / region[..., 3:4], 0)
+                    region[..., :3] = straight * old_a
+                    region[..., 3:4] = old_a
+
+
+def _paint_opts(op: dict[str, Any]) -> dict[str, Any]:
+    return {"opacity": float(op.get("opacity", 1.0)), "lock_alpha": bool(op.get("lock_alpha", False)),
+            "erase": bool(op.get("erase", False))}
+
+
+def _gradient(op: dict[str, Any], w: int, h: int) -> np.ndarray:
+    stops = sorted(((float(o), rgba01(c)) for o, c in op["stops"]), key=lambda s: s[0])
     if not stops:
         raise SceneError("gradient needs at least one stop")
-    # 256-entry lookup table from the stops.
-    lut = []
-    for i in range(256):
-        t = i / 255
-        if t <= stops[0][0]:
-            lut.append(stops[0][1])
-            continue
-        if t >= stops[-1][0]:
-            lut.append(stops[-1][1])
-            continue
-        for (o0, c0), (o1, c1) in zip(stops, stops[1:]):
-            if o0 <= t <= o1:
-                f = 0.0 if o1 == o0 else (t - o0) / (o1 - o0)
-                lut.append(tuple(round(a + (b - a) * f) for a, b in zip(c0, c1)))
-                break
-
+    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32) + 0.5
     kind = op.get("kind", "linear")
     if kind == "linear":
         x0, y0 = op.get("x0", 0), op.get("y0", 0)
-        x1, y1 = op.get("x1", 0), op.get("y1", h)
-        dx, dy = x1 - x0, y1 - y0
-        denom = dx * dx + dy * dy or 1
-        t_of = lambda x, y: ((x - x0) * dx + (y - y0) * dy) / denom  # noqa: E731
+        dx, dy = op.get("x1", 0) - x0, op.get("y1", h) - y0
+        t = ((xs - x0) * dx + (ys - y0) * dy) / (dx * dx + dy * dy or 1)
     elif kind == "radial":
-        cx, cy = op.get("cx", w / 2), op.get("cy", h / 2)
-        r = op.get("r", max(w, h) / 2) or 1
-        t_of = lambda x, y: math.hypot(x - cx, y - cy) / r  # noqa: E731
+        t = np.hypot(xs - op.get("cx", w / 2), ys - op.get("cy", h / 2)) / (op.get("r", max(w, h) / 2) or 1)
     else:
         raise SceneError(f"gradient kind must be 'linear' or 'radial', got {kind!r}")
+    offs = [s[0] for s in stops]
+    # Interpolate premultiplied so fading to a transparent stop has no dark fringe.
+    alpha = np.interp(t, offs, [s[1][3] for s in stops])
+    out = np.empty((h, w, 4), np.float32)
+    for ch in range(3):
+        prem = np.interp(t, offs, [s[1][ch] * s[1][3] for s in stops])
+        out[..., ch] = np.where(alpha > 1e-6, prem / np.maximum(alpha, 1e-6), 0)
+    out[..., 3] = alpha
+    return out
 
-    # Compute t on a coarse grid and let Pillow upscale it smoothly; this keeps
-    # large canvases fast without numpy.
-    step = max(1, min(w, h) // 256)
-    gw, gh = math.ceil(w / step), math.ceil(h / step)
-    tmap = Image.new("L", (gw, gh))
-    tmap.putdata([
-        max(0, min(255, round(t_of((gx + 0.5) * step, (gy + 0.5) * step) * 255)))
-        for gy in range(gh) for gx in range(gw)
-    ])
-    if step > 1:
-        tmap = tmap.resize((w, h), Image.BILINEAR)
-    bands = [tmap.point([c[i] for c in lut]) for i in range(4)]
-    return Image.merge("RGBA", bands)
+
+def _layer_key(layer: Layer, w: int, h: int) -> str:
+    return hashlib.sha1(json.dumps([w, h, layer.name, layer.ops], sort_keys=True).encode()).hexdigest()
+
+
+def render_layer_array(layer: Layer, w: int, h: int) -> np.ndarray:
+    """Render one layer to a premultiplied float array (cached by content)."""
+    key = _layer_key(layer, w, h)
+    if key in _CACHE:
+        _CACHE.move_to_end(key)
+        return _CACHE[key]
+    arr = LayerRenderer(w, h, Paper(w, h)).render(layer)
+    _CACHE[key] = arr
+    while len(_CACHE) > _CACHE_SIZE:
+        _CACHE.popitem(last=False)
+    return arr
 
 
 def render_layer(layer: Layer, w: int, h: int) -> Image.Image:
-    s = SUPERSAMPLE
-    img = Image.new("RGBA", (w * s, h * s), (0, 0, 0, 0))
-
-    def flush_to(base: Image.Image, overlay: Image.Image) -> Image.Image:
-        return Image.alpha_composite(base, overlay)
-
-    for op in layer.ops:
-        kind = op["op"]
-        over = Image.new("RGBA", img.size, (0, 0, 0, 0))
-        d = ImageDraw.Draw(over)
-        sc = lambda v: v * s  # noqa: E731
-        pts = [(sc(x), sc(y)) for x, y in op.get("points", [])]
-        width = round(sc(op.get("width", 1)))
-
-        if kind == "fill":
-            over = Image.new("RGBA", img.size, parse_color(op["color"]))
-        elif kind == "rect":
-            box = [sc(op["x"]), sc(op["y"]), sc(op["x"] + op["w"]), sc(op["y"] + op["h"])]
-            kw = dict(fill=parse_color(op.get("fill")) if op.get("fill") else None,
-                      outline=parse_color(op.get("stroke")) if op.get("stroke") else None, width=width)
-            if op.get("radius"):
-                d.rounded_rectangle(box, radius=sc(op["radius"]), **kw)
-            else:
-                d.rectangle(box, **kw)
-        elif kind == "ellipse":
-            box = [sc(op["cx"] - op["rx"]), sc(op["cy"] - op["ry"]), sc(op["cx"] + op["rx"]), sc(op["cy"] + op["ry"])]
-            d.ellipse(box, fill=parse_color(op.get("fill")) if op.get("fill") else None,
-                      outline=parse_color(op.get("stroke")) if op.get("stroke") else None, width=width)
-        elif kind == "polygon":
-            if op.get("fill"):
-                d.polygon(pts, fill=parse_color(op["fill"]))
-            if op.get("stroke"):
-                d.line([*pts, pts[0]], fill=parse_color(op["stroke"]), width=width, joint="curve")
-        elif kind in ("line", "stroke"):
-            color = parse_color(op.get("color", "#000000"))
-            if kind == "stroke" and op.get("smooth", True):
-                pts = _catmull_rom(pts)
-            if len(pts) > 1:
-                d.line(pts, fill=color, width=width, joint="curve")
-            if kind == "stroke":  # round caps (and a dot for single-point strokes)
-                r = width / 2
-                for x, y in (pts[0], pts[-1]):
-                    d.ellipse([x - r, y - r, x + r, y + r], fill=color)
-        elif kind == "gradient":
-            over = _gradient(op, w, h).resize(img.size, Image.BILINEAR)
-        elif kind == "scatter":
-            rng = random.Random(op.get("seed", 0))
-            rx, ry, rw, rh = op.get("region", [0, 0, w, h])
-            rmin, rmax = op.get("radius", [1, 2])
-            colors = [parse_color(c) for c in op.get("colors", ["#ffffff"])]
-            for _ in range(int(op["count"])):
-                x, y = sc(rx + rng.random() * rw), sc(ry + rng.random() * rh)
-                r = sc(rng.uniform(rmin, rmax))
-                c = rng.choice(colors)
-                if op.get("shape", "circle") == "star":
-                    d.polygon(_star(x, y, r), fill=c)
-                else:
-                    d.ellipse([x - r, y - r, x + r, y + r], fill=c)
-        elif kind == "text":
-            size = round(sc(op.get("size", 24)))
-            font = ImageFont.truetype(op["font"], size) if op.get("font") else ImageFont.load_default(size)
-            d.text((sc(op["x"]), sc(op["y"])), str(op["text"]), fill=parse_color(op.get("color", "#000000")),
-                   font=font, anchor=op.get("anchor", "la"))
-        elif kind == "blur":
-            img = img.filter(ImageFilter.GaussianBlur(sc(op["radius"])))
-            continue
-
-        img = flush_to(img, over)
-
-    return img.resize((w, h), Image.LANCZOS)
+    return to_image(render_layer_array(layer, w, h))
 
 
 def render_layers(scene: Scene) -> list[tuple[Layer, Image.Image]]:
@@ -195,17 +349,17 @@ def apply_opacity(img: Image.Image, opacity: float) -> Image.Image:
     if opacity >= 1:
         return img
     r, g, b, a = img.split()
-    a = a.point(lambda v: round(v * max(0.0, opacity)))
-    return Image.merge("RGBA", (r, g, b, a))
+    return Image.merge("RGBA", (r, g, b, a.point(lambda v: round(v * max(0.0, opacity)))))
 
 
 def background_image(scene: Scene) -> Image.Image:
     return Image.new("RGBA", (scene.width, scene.height), parse_color(scene.background))
 
 
-def composite(scene: Scene, rendered: list[tuple[Layer, Image.Image]] | None = None) -> Image.Image:
-    out = background_image(scene)
-    for layer, img in rendered if rendered is not None else render_layers(scene):
+def composite(scene: Scene) -> Image.Image:
+    out = from_image(background_image(scene))
+    for layer in scene.layers:
         if layer.visible:
-            out = Image.alpha_composite(out, apply_opacity(img, layer.opacity))
-    return out
+            out = composite_over(out, render_layer_array(layer, scene.width, scene.height), layer.blend,
+                                 layer.opacity)
+    return to_image(out)

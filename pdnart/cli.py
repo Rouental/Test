@@ -13,7 +13,7 @@ from .scene import Scene
 def cmd_render(args: argparse.Namespace) -> None:
     scene = Scene.load(args.scene)
     rendered = render_layers(scene)
-    composite(scene, rendered).save(args.output)
+    composite(scene).save(args.output)
     print(f"wrote {args.output}")
     if args.layers:
         out = Path(args.layers)
@@ -27,7 +27,8 @@ def cmd_render(args: argparse.Namespace) -> None:
 def cmd_send(args: argparse.Namespace) -> None:
     from .paintnet import PaintDotNet
 
-    PaintDotNet(exe=args.exe, delay=args.delay).send_scene(Scene.load(args.scene), args.save)
+    for warning in PaintDotNet(exe=args.exe, delay=args.delay).send_scene(Scene.load(args.scene), args.save):
+        print("warning:", warning)
     print("sent to paint.net")
 
 

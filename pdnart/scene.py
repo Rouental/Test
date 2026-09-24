@@ -20,34 +20,67 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .brushes import BRUSH_PARAMS, PRESETS
+from .raster import BLEND_MODES
+
+# Every painting op accepts these: opacity multiplies the op's alpha, lock_alpha only paints
+# where the layer already has pixels (shade inside a shape), erase removes instead of paints.
+COMMON = {"opacity", "lock_alpha", "erase", "clip"}
+SHAPE = {"fill", "stroke", "width", "feather"} | COMMON
+PATH = {"points", "paths"}  # one of the two is required
+
 # op name -> (required keys, optional keys)
 OP_SPECS: dict[str, tuple[set[str], set[str]]] = {
-    "rect": ({"x", "y", "w", "h"}, {"fill", "stroke", "width", "radius"}),
-    "ellipse": ({"cx", "cy", "rx", "ry"}, {"fill", "stroke", "width"}),
-    "polygon": ({"points"}, {"fill", "stroke", "width"}),
-    "line": ({"points"}, {"color", "width"}),
-    "stroke": ({"points"}, {"color", "width", "smooth"}),
-    "gradient": ({"stops"}, {"kind", "x0", "y0", "x1", "y1", "cx", "cy", "r"}),
-    "scatter": ({"count"}, {"region", "radius", "colors", "seed", "shape"}),
-    "text": ({"x", "y", "text"}, {"size", "color", "font", "anchor"}),
-    "blur": ({"radius"}, set()),
-    "fill": ({"color"}, set()),
+    "rect": ({"x", "y", "w", "h"}, SHAPE | {"radius"}),
+    "ellipse": ({"cx", "cy", "rx", "ry"}, SHAPE | {"angle"}),
+    "polygon": ({"points"}, SHAPE | {"smooth"}),
+    "brush": (set(), PATH | BRUSH_PARAMS | COMMON | {"brush", "color", "seed"}),
+    "stroke": (set(), PATH | COMMON | {"color", "width", "smooth"}),
+    "line": ({"points"}, COMMON | {"color", "width"}),
+    "hatch": ({"region"}, COMMON | BRUSH_PARAMS | {"brush", "color", "angle", "gap", "cross", "seed"}),
+    "smudge": (set(), PATH | {"size", "strength", "hardness", "smooth", "lock_alpha", "clip"}),
+    "gradient": ({"stops"}, COMMON | {"kind", "x0", "y0", "x1", "y1", "cx", "cy", "r"}),
+    "scatter": ({"count"}, COMMON | {"region", "radius", "colors", "seed", "shape"}),
+    "text": ({"x", "y", "text"}, COMMON | {"size", "color", "font", "anchor"}),
+    "image": ({"path"}, COMMON | {"x", "y", "w", "h"}),
+    "blur": ({"radius"}, {"clip"}),
+    "fill": ({"color"}, COMMON),
 }
 
 OP_HELP = {
-    "rect": "Rectangle at x,y of size w,h. Optional fill, stroke, width (outline px), radius (rounded corners).",
-    "ellipse": "Ellipse centred at cx,cy with radii rx,ry. Optional fill, stroke, width.",
-    "polygon": "Closed polygon through points [[x,y],...]. Optional fill, stroke, width.",
+    "brush": "Paint a stroke with a natural-media brush through points [[x,y] or [x,y,pressure 0..1], ...] "
+    "(or many strokes at once via paths=[[...],[...]]). brush=one of BRUSHES; color; size (px); and any brush "
+    "setting to override: hardness, flow, opacity, spacing, taper [start,end], jitter, wobble, grain, "
+    "bristles, dryness, color_variation, pressure_size, pressure_opacity, smooth. Pressure makes lines "
+    "swell and thin like a real stylus.",
+    "hatch": "Shade a polygon region=[[x,y],...] with parallel strokes (default pencil): angle (deg), gap (px), "
+    "cross=true for cross-hatching, plus brush/color/size and brush settings.",
+    "smudge": "Blend (soften) existing paint on this layer along points/paths: size, strength 0..1. "
+    "Use it to melt brush strokes together, e.g. skin tones. lock_alpha=true keeps paint from spreading "
+    "past its edges.",
+    "rect": "Rectangle x,y,w,h. fill, stroke, width, radius (rounded corners), feather (soft edge px).",
+    "ellipse": "Ellipse at cx,cy with radii rx,ry, optionally rotated by angle (deg). fill, stroke, width, feather.",
+    "polygon": "Closed shape through points. smooth=true makes an organic curved outline. fill, stroke, width, "
+    "feather.",
+    "stroke": "Simple hard round line through points with color and width (smooth by default).",
     "line": "Straight polyline through points with color and width.",
-    "stroke": "Brush stroke through points with round caps; smooth=true (default) curves it through the points.",
-    "gradient": "Fill the layer with a gradient. kind='linear' uses x0,y0 -> x1,y1; kind='radial' uses cx,cy,r. "
-    "stops=[[offset 0..1, color], ...].",
-    "scatter": "Scatter `count` dots (shape 'circle' or 'star') in region [x,y,w,h] (default whole canvas); "
-    "radius=[min,max]; colors=[...]; seed for repeatability.",
-    "text": "Draw text at x,y. Optional size (px), color, font (path to .ttf), anchor (Pillow anchor, default 'la').",
-    "blur": "Gaussian-blur everything drawn on this layer so far (great for glows and soft shadows).",
+    "gradient": "Fill the layer with a gradient: kind='linear' (x0,y0 -> x1,y1) or 'radial' (cx,cy,r); "
+    "stops=[[offset 0..1, color], ...]. Combine with lock_alpha to shade a shape you already painted.",
+    "scatter": "Scatter count dots (shape 'circle' or 'star') in region [x,y,w,h]; radius=[min,max]; colors; seed.",
+    "text": "Text at x,y. size (px), color, font (.ttf path), anchor (Pillow anchor, default 'la').",
+    "image": "Place an image file (e.g. a reference photo or texture) at x,y, optionally resized to w,h.",
+    "blur": "Gaussian-blur everything on this layer so far (glows, atmosphere, soft shadows).",
     "fill": "Flood the whole layer with a color.",
+    "common": "Painting ops also take opacity (0..1), lock_alpha (only paint where the layer already has "
+    "paint), erase (remove paint instead of adding it), and clip: a selection the op is confined to, "
+    "either [[x,y],...] or {points, smooth, feather, invert}.",
+    "layers": "Layers take opacity and blend: " + ", ".join(BLEND_MODES) + ". A multiply layer is ideal for "
+    "pencil/ink linework and shadows; screen/additive for light.",
 }
+
+BRUSH_HELP = {name: f"size {b.size:g}, hardness {b.hardness:g}" + (f", {b.bristles} bristles" if b.bristles else "")
+              + (", paper grain" if b.grain else "") + (", builds up" if b.buildup else "")
+              + (", wet edges" if b.wet_edge else "") for name, b in PRESETS.items()}
 
 
 class SceneError(ValueError):
@@ -68,8 +101,17 @@ def validate_op(op: dict[str, Any]) -> dict[str, Any]:
     unknown = keys - required - optional
     if unknown:
         raise SceneError(f"op {kind!r} does not accept {sorted(unknown)}")
-    if "points" in op and len(op["points"]) < (3 if kind == "polygon" else 1):
-        raise SceneError(f"op {kind!r} needs more points")
+    if PATH <= (required | optional) and not (keys & PATH):
+        raise SceneError(f"op {kind!r} needs 'points' or 'paths'")
+    if kind == "polygon" and len(op["points"]) < 3:
+        raise SceneError("polygon needs at least 3 points")
+    if kind == "hatch" and len(op["region"]) < 3:
+        raise SceneError("hatch region needs at least 3 points")
+    if op.get("brush") is not None and op["brush"] not in PRESETS:
+        raise SceneError(f"unknown brush {op['brush']!r}; presets are {sorted(PRESETS)}")
+    for path in op.get("paths", [op["points"]] if "points" in op else []):
+        if not path or any(not isinstance(p, (list, tuple)) or len(p) not in (2, 3) for p in path):
+            raise SceneError(f"op {kind!r}: points must be non-empty lists of [x, y] or [x, y, pressure]")
     return op
 
 
@@ -79,16 +121,23 @@ class Layer:
     opacity: float = 1.0
     visible: bool = True
     ops: list[dict[str, Any]] = field(default_factory=list)
+    blend: str = "normal"
+
+    def __post_init__(self) -> None:
+        if self.blend not in BLEND_MODES:
+            raise SceneError(f"blend must be one of {BLEND_MODES}, got {self.blend!r}")
 
     def add(self, op: dict[str, Any]) -> None:
         self.ops.append(validate_op(op))
 
     def to_dict(self) -> dict[str, Any]:
-        return {"name": self.name, "opacity": self.opacity, "visible": self.visible, "ops": self.ops}
+        return {"name": self.name, "opacity": self.opacity, "visible": self.visible, "blend": self.blend,
+                "ops": self.ops}
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Layer:
-        layer = cls(d["name"], float(d.get("opacity", 1.0)), bool(d.get("visible", True)))
+        layer = cls(d["name"], float(d.get("opacity", 1.0)), bool(d.get("visible", True)),
+                    blend=d.get("blend", "normal"))
         for op in d.get("ops", []):
             layer.add(op)
         return layer
@@ -111,10 +160,10 @@ class Scene:
                 return layer
         raise SceneError(f"no layer named {name!r}; layers are {[l.name for l in self.layers]}")
 
-    def add_layer(self, name: str, opacity: float = 1.0) -> Layer:
+    def add_layer(self, name: str, opacity: float = 1.0, blend: str = "normal") -> Layer:
         if any(l.name == name for l in self.layers):
             raise SceneError(f"layer {name!r} already exists")
-        layer = Layer(name, opacity)
+        layer = Layer(name, opacity, blend=blend)
         self.layers.append(layer)
         return layer
 
