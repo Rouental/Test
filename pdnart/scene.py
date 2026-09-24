@@ -44,6 +44,11 @@ OP_SPECS: dict[str, tuple[set[str], set[str]]] = {
     "text": ({"x", "y", "text"}, COMMON | {"size", "color", "font", "anchor"}),
     "image": ({"path"}, COMMON | {"x", "y", "w", "h"}),
     "blur": ({"radius"}, {"clip"}),
+    "form": ({"region"}, COMMON | {"bumps", "inflate", "light", "ramp", "wrap", "occlusion", "ambient", "bounce",
+                                   "shine", "shine_size", "feather"}),
+    "copy": ({"source"}, COMMON),
+    "painterly": ({"source"}, COMMON | BRUSH_PARAMS | {"brush", "sizes", "threshold", "length", "curvature",
+                                                        "angle", "color_jitter", "grid", "blur", "region", "seed"}),
     "fill": ({"color"}, COMMON),
 }
 
@@ -70,6 +75,20 @@ OP_HELP = {
     "text": "Text at x,y. size (px), color, font (.ttf path), anchor (Pillow anchor, default 'la').",
     "image": "Place an image file (e.g. a reference photo or texture) at x,y, optionally resized to w,h.",
     "blur": "Gaussian-blur everything on this layer so far (glows, atmosphere, soft shadows).",
+    "copy": "Paint another layer's pixels (or several layers flattened, or {path}) onto this one, e.g. a "
+    "smooth study at low opacity over its painterly version, as a glaze. Takes opacity, clip, lock_alpha.",
+    "form": "Paint a lit 3D form. region = silhouette points (smoothed); inflate = how rounded (px); "
+    "bumps = [{x, y, rx, ry, h, angle, profile:'gauss'|'sphere'}] add mounds (h>0: cheekbone, nose, brow) "
+    "and hollows (h<0: eye socket, mouth corner); light = [x, y, z] direction toward the light (y down, z "
+    "toward viewer); ramp = [[0, shadow], [0.5, midtone], [1, light]] colours; wrap (soft terminator), "
+    "occlusion, ambient, bounce = [color, strength] reflected light, shine / shine_size specular. "
+    "Great as a hidden study layer that a painterly op then repaints.",
+    "painterly": "Repaint a source with real brush strokes, big to small, following the form. source = a "
+    "layer name (usually a hidden study layer of smooth shapes / forms), a list of layer names (flattened "
+    "with their blend modes, e.g. a form plus a multiply colour layer), or {path, x, y, w, h} for an image "
+    "file such as a reference photo. sizes = brush diameters, e.g. [28, 14, 7, 4]; threshold (0..1, lower = "
+    "more strokes and detail); length = [min, max] stroke segments; curvature; angle (fixed direction, deg); "
+    "brush + brush settings; region = polygon to limit where strokes start.",
     "fill": "Flood the whole layer with a color.",
     "common": "Painting ops also take opacity (0..1), lock_alpha (only paint where the layer already has "
     "paint), erase (remove paint instead of adding it), and clip: a selection the op is confined to, "
@@ -107,6 +126,11 @@ def validate_op(op: dict[str, Any]) -> dict[str, Any]:
         raise SceneError("polygon needs at least 3 points")
     if kind == "hatch" and len(op["region"]) < 3:
         raise SceneError("hatch region needs at least 3 points")
+    if kind in ("painterly", "copy"):
+        src = op["source"]
+        if not (isinstance(src, str) or (isinstance(src, list) and src and all(isinstance(n, str) for n in src))
+                or (isinstance(src, dict) and "path" in src)):
+            raise SceneError(kind + ' source must be a layer name, a list of layer names, or {"path": ...}')
     if op.get("brush") is not None and op["brush"] not in PRESETS:
         raise SceneError(f"unknown brush {op['brush']!r}; presets are {sorted(PRESETS)}")
     for path in op.get("paths", [op["points"]] if "points" in op else []):
@@ -149,6 +173,7 @@ class Scene:
     height: int
     background: Any = "#ffffff"  # None for a transparent background
     layers: list[Layer] = field(default_factory=list)
+    base_dir: Path | None = field(default=None, compare=False, repr=False)  # resolves relative file paths
 
     def __post_init__(self) -> None:
         if not (1 <= self.width <= 16384 and 1 <= self.height <= 16384):
@@ -187,4 +212,6 @@ class Scene:
 
     @classmethod
     def load(cls, path: str | Path) -> Scene:
-        return cls.from_dict(json.loads(Path(path).read_text()))
+        scene = cls.from_dict(json.loads(Path(path).read_text()))
+        scene.base_dir = Path(path).resolve().parent
+        return scene

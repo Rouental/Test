@@ -26,12 +26,19 @@ server = _Server(
     "pdnart",
     instructions=(
         "Paint pictures as layered scenes and open them in paint.net. Call op_reference first for the drawing "
-        "ops and brushes. Work like a painter, back to front: a pencil sketch layer (brush='pencil', multiply "
-        "blend) to place things; flat block-in shapes (polygon smooth=true); then model light and shadow with "
-        "brush strokes clipped to those shapes (lock_alpha=true or clip=...); blend with smudge; add detail "
-        "with small brushes; finish with ink/pencil linework and hatching on a multiply layer. Paint many "
-        "strokes at once with paths=[...]. Call preview often (grid=true to read coordinates, region=[x,y,w,h] "
-        "to zoom into details), fix what looks wrong (undo, set_layer), then send_to_paintnet."
+        "ops and brushes. Work like a painter, back to front. For anything with volume (faces, figures, "
+        "fruit, rocks, cloth), use the study-then-paint method: 1) on hidden study layers "
+        "(set_layer visible=false), model each mass as a lit 3D `form`: a silhouette plus bumps for what "
+        "sticks out (brow, cheekbones, nose, lips, chin) and negative bumps for hollows (eye sockets), "
+        "with one consistent light direction and a colour ramp from shadow to light; add local colour "
+        "(lips, flushed cheeks) on a multiply study layer. 2) On visible layers, `painterly` repaints the "
+        "studies with real brush strokes (sizes big to small, clip to the silhouette), and a `copy` of "
+        "the study at ~0.3-0.5 opacity glazes it smooth where needed (skin). 3) Paint crisp details with "
+        "small brushes: eyes, brows, lashes, nostrils, the line of the mouth, hair strands. 4) Finish "
+        "with pencil/ink linework or hatching on a multiply layer. Flat subjects (skies, meadows) can "
+        "be painted directly with brush strokes. Paint many strokes at once with paths=[...]. Call "
+        "preview often (grid=true to read coordinates, region=[x,y,w,h] to zoom into details) and fix "
+        "what looks wrong (undo, set_layer), then send_to_paintnet."
     ),
 )
 

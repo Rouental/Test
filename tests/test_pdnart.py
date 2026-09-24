@@ -136,6 +136,66 @@ def test_hatch_stays_inside_region():
     assert alpha.crop((0, 0, 100, 15)).getextrema()[1] == 0
 
 
+def _disc(cx, cy, r, n=24):
+    import math
+
+    return [[cx + r * math.cos(2 * math.pi * k / n), cy + r * math.sin(2 * math.pi * k / n)] for k in range(n)]
+
+
+def test_form_is_lit_from_the_light_direction():
+    scene = Scene(120, 120, background=None)
+    scene.add_layer("f").add({"op": "form", "region": _disc(60, 60, 50), "inflate": 50, "light": [-1, 0, 0.3],
+                              "ramp": [[0, "#000000"], [1, "#ffffff"]]})
+    img = composite(scene)
+    left, right = img.getpixel((25, 60))[0], img.getpixel((95, 60))[0]
+    assert left > right + 80  # the side facing the light is much brighter
+    assert img.getpixel((2, 2))[3] == 0  # nothing painted outside the silhouette
+    # a hollow on the lit side catches less light than the surface around it
+    scene.layers[0].ops[0]["bumps"] = [{"x": 40, "y": 60, "rx": 8, "ry": 8, "h": -15}]
+    scene.layers[0].ops[0] = dict(scene.layers[0].ops[0])
+    assert composite(scene).getpixel((34, 60))[0] < left
+
+
+def test_painterly_repaints_a_study_with_strokes():
+    scene = Scene(160, 120, background="#ffffff")
+    study = scene.add_layer("study")
+    study.visible = False
+    study.add({"op": "rect", "x": 0, "y": 0, "w": 80, "h": 120, "fill": "#cc3322"})
+    study.add({"op": "rect", "x": 80, "y": 0, "w": 80, "h": 120, "fill": "#2244aa"})
+    scene.add_layer("paint").add({"op": "painterly", "source": "study", "sizes": [16, 8], "seed": 1})
+    img = composite(scene)
+    r, g, b, _ = img.getpixel((30, 60))
+    assert r > 150 and b < 90
+    r, g, b, _ = img.getpixel((130, 60))
+    assert b > 120 and r < 90
+    # changing the study invalidates the painted layer's cache
+    study.ops[0] = {"op": "rect", "x": 0, "y": 0, "w": 80, "h": 120, "fill": "#22aa44"}
+    assert composite(scene).getpixel((30, 60))[1] > 120
+
+
+def test_painterly_and_copy_from_an_image_file(tmp_path):
+    from PIL import Image
+
+    Image.new("RGB", (40, 30), "#10a050").save(tmp_path / "ref.png")
+    scene = Scene(60, 40, background=None)
+    layer = scene.add_layer("p")
+    layer.add({"op": "painterly", "source": {"path": "ref.png", "x": 10, "y": 5}, "sizes": [8, 4]})
+    scene.save(tmp_path / "scene.json")
+    loaded = Scene.load(tmp_path / "scene.json")  # relative paths resolve next to the scene file
+    img = composite(loaded)
+    assert img.getpixel((30, 20))[1] > 120
+    assert img.getpixel((2, 2))[3] == 0
+    loaded.layers[0].ops = [{"op": "copy", "source": {"path": "ref.png"}, "opacity": 0.5}]
+    assert 100 < composite(loaded).getpixel((5, 5))[3] < 160
+
+
+def test_painterly_source_validation():
+    layer = Scene(10, 10).add_layer("l")
+    with pytest.raises(SceneError, match="source"):
+        layer.add({"op": "painterly", "source": 5})
+    layer.add({"op": "painterly", "source": ["a", "b"]})
+
+
 def test_every_op_renders():
     scene = Scene(120, 80)
     layer = scene.add_layer("all")
@@ -179,6 +239,11 @@ def test_cli_render_writes_layers(tmp_path):
 def test_example_scenes_load(name):
     scene = Scene.load(EXAMPLES / f"{name}.json")
     assert len(scene.layers) >= 6
+    for layer in scene.layers:  # every painterly/copy source refers to a real layer
+        for op in layer.ops:
+            src = op.get("source")
+            for n in [src] if isinstance(src, str) else src if isinstance(src, list) else []:
+                scene.layer(n)
 
 
 def test_mcp_tools_build_and_preview():

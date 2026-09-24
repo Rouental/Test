@@ -95,15 +95,11 @@ def _catmull_rom(p: np.ndarray, steps: int = 10) -> np.ndarray:
     if len(p) < 3:
         return p
     q = np.vstack([p[:1], p, p[-1:]])
-    t = np.linspace(0, 1, steps, endpoint=False)[:, None]
-    t2, t3 = t * t, t * t * t
-    out = []
-    for i in range(1, len(q) - 2):
-        p0, p1, p2, p3 = q[i - 1], q[i], q[i + 1], q[i + 2]
-        out.append(0.5 * (2 * p1 + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2
-                          + (-p0 + 3 * p1 - 3 * p2 + p3) * t3))
-    out.append(p[-1:])
-    return np.vstack(out)
+    p0, p1, p2, p3 = (q[k:len(q) - 3 + k][:, None, :] for k in range(4))
+    t = np.linspace(0, 1, steps, endpoint=False)[None, :, None]
+    seg = 0.5 * (2 * p1 + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t
+                 + (-p0 + 3 * p1 - 3 * p2 + p3) * t ** 3)
+    return np.vstack([seg.reshape(-1, p.shape[1]), p[-1:]])
 
 
 def _dabs(points: list, b: Brush, rng: np.random.Generator):
@@ -257,15 +253,14 @@ def stroke_masks(points: list, b: Brush, color, rng: np.random.Generator, paper:
     length_px = float(np.hypot(np.diff(x), np.diff(y)).sum()) if len(x) > 1 else 1.0
     u = np.linspace(-1, 1, PROFILE_BINS)
     tints = [color, _shift_lightness(color, b.color_variation), _shift_lightness(color, -b.color_variation)]
-    profiles = [np.zeros((len(t), PROFILE_BINS), np.float32) for _ in range(3)]
-    for j in range(m):
-        cycles = rng.uniform(1, 4, 3) * max(1.0, length_px / 60)
-        noise = sum(np.sin(2 * np.pi * c * t + ph) for c, ph in zip(cycles, rng.uniform(0, 6.3, 3)))
-        noise = (noise / 3 + 1) / 2  # 0..1, smooth along the stroke
-        load = np.clip(1 - dry_rate[j] * t, 0, 1)
-        vis = np.clip((load - noise * min(1.0, b.dryness) * 0.7) * 4, 0, 1) * strength[j]
-        ridge = np.exp(-0.5 * ((u - offsets[j]) / width[j]) ** 2)
-        np.maximum(profiles[j % 3], vis[:, None] * ridge[None, :], out=profiles[j % 3])
+    cycles = rng.uniform(1, 4, (m, 3)) * max(1.0, length_px / 60)
+    phases = rng.uniform(0, 6.3, (m, 3))
+    noise = np.sin(2 * np.pi * cycles[:, :, None] * t[None, None, :] + phases[:, :, None]).sum(1)
+    noise = (noise / 3 + 1) / 2  # (m, n): 0..1, smooth along the stroke
+    load = np.clip(1 - dry_rate[:, None] * t[None, :], 0, 1)
+    vis = (np.clip((load - noise * min(1.0, b.dryness) * 0.7) * 4, 0, 1) * strength[:, None]).astype(np.float32)
+    ridge = np.exp(-0.5 * ((u[None, :] - offsets[:, None]) / width[:, None]) ** 2).astype(np.float32)
+    profiles = [(vis[g::3, :, None] * ridge[g::3, None, :]).max(0) for g in range(3)]
     colors = tints
     if body > 0:  # the body: a slightly narrower, semi-opaque base under the streaks
         profiles.insert(0, np.broadcast_to(np.where(np.abs(u) < 0.94, body, 0).astype(np.float32),

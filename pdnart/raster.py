@@ -124,3 +124,23 @@ def from_image(img: Image.Image) -> np.ndarray:
     arr = np.asarray(img.convert("RGBA"), np.float32) / 255
     arr[..., :3] *= arr[..., 3:4]
     return arr
+
+
+def gblur_exact(a: np.ndarray, sigma: float) -> np.ndarray:
+    """True (isotropic) Gaussian blur of a 2D array via FFT, with zero padding outside.
+
+    Slower than gblur but free of the box-filter anisotropy, which matters when the result is
+    differentiated (surface normals for lighting).
+    """
+    if sigma < 0.3:
+        return a
+    pad = int(3 * sigma) + 1
+    h, w = a.shape
+    H, W = h + 2 * pad, w + 2 * pad
+    fy = np.fft.fftfreq(H)[:, None]
+    fx = np.fft.rfftfreq(W)[None, :]
+    kernel = np.exp(-2 * (np.pi * sigma) ** 2 * (fx * fx + fy * fy))
+    padded = np.zeros((H, W), np.float64)
+    padded[pad:pad + h, pad:pad + w] = a
+    out = np.fft.irfft2(np.fft.rfft2(padded) * kernel, s=(H, W))
+    return out[pad:pad + h, pad:pad + w].astype(np.float32)

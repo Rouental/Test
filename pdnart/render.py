@@ -11,12 +11,16 @@ import json
 import math
 import zlib
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
 from PIL import Image, ImageColor, ImageDraw, ImageFont
 
 from .brushes import Brush, Paper, _stamp, make_brush, stroke_masks
+from .form import DEFAULT_RAMP
+from .form import shade as form_shade
+from .painterly import repaint
 from .raster import composite_over, from_image, gblur, new_layer, paint, to_image
 from .scene import Layer, Scene, SceneError
 
@@ -63,8 +67,36 @@ def _star(cx: float, cy: float, r: float) -> list[tuple[float, float]]:
 
 
 class LayerRenderer:
-    def __init__(self, w: int, h: int, paper: Paper):
-        self.w, self.h, self.paper = w, h, paper
+    def __init__(self, w: int, h: int, paper: Paper, scene: Scene | None = None):
+        self.w, self.h, self.paper, self.scene = w, h, paper, scene
+
+    def _path(self, path: str) -> str:
+        """Resolve a file path relative to the scene file, if the scene was loaded from one."""
+        base = getattr(self.scene, "base_dir", None)
+        if base is not None and not Path(path).is_absolute() and not Path(path).exists():
+            return str(Path(base) / path)
+        return path
+
+    def _source(self, op: dict[str, Any]) -> np.ndarray:
+        """A canvas-sized premultiplied image to paint from: another layer, or an image file."""
+        src = op["source"]
+        if isinstance(src, dict) and "path" in src:
+            img = Image.open(self._path(src["path"])).convert("RGBA")
+            x, y = int(src.get("x", 0)), int(src.get("y", 0))
+            if "w" in src or "h" in src:
+                img = img.resize((int(src.get("w", img.width)), int(src.get("h", img.height))), Image.LANCZOS)
+            canvas = Image.new("RGBA", (self.w, self.h))
+            canvas.paste(img, (x, y))
+            return from_image(canvas)
+        if self.scene is None:
+            raise SceneError("a layer source needs the scene")
+        names = [src] if isinstance(src, str) else list(src)
+        out = new_layer(self.w, self.h)
+        for i, name in enumerate(names):  # several study layers are flattened with their blend modes
+            spec = self.scene.layer(name)
+            arr = render_layer_array(spec, self.w, self.h, self.scene)
+            out = arr.copy() if i == 0 else composite_over(out, arr, spec.blend, spec.opacity)
+        return out
 
     # -- helpers -----------------------------------------------------------
     def _raster(self, bbox, draw: Callable[[ImageDraw.ImageDraw, Callable], None], feather: float = 0):
@@ -218,14 +250,42 @@ class LayerRenderer:
                                      anchor=op.get("anchor", "la"))
             paint(layer, np.asarray(img, np.float32) / 255, 0, 0, rgba01(op.get("color", "#000000")), **opts)
         elif kind == "image":
-            img = Image.open(op["path"]).convert("RGBA")
+            img = Image.open(self._path(op["path"])).convert("RGBA")
             if "w" in op or "h" in op:
                 img = img.resize((int(op.get("w", img.width)), int(op.get("h", img.height))), Image.LANCZOS)
             arr = np.asarray(img, np.float32) / 255
             paint(layer, np.ones(arr.shape[:2], np.float32), int(op.get("x", 0)), int(op.get("y", 0)), arr, **opts)
         elif kind == "blur":
             layer = gblur(layer, float(op["radius"]))
+        elif kind == "form":
+            self._form(layer, op)
+        elif kind == "copy":
+            src = self._source(op)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                straight = np.where(src[..., 3:4] > 1e-6, src[..., :3] / src[..., 3:4], 0)
+            paint(layer, src[..., 3], 0, 0, np.concatenate([straight, np.ones_like(src[..., 3:4])], -1),
+                  **_paint_opts(op))
+        elif kind == "painterly":
+            region = self.clip_mask(op["region"]) if op.get("region") else None
+            repaint(layer, self._source(op), op, rng, self.paper, region)
         return layer
+
+    def _form(self, layer, op):
+        spec = op["region"] if isinstance(op["region"], dict) else {"points": op["region"]}
+        pts = [tuple(p[:2]) for p in spec["points"]]
+        if spec.get("smooth", True):
+            pts = _catmull_rom_closed(pts)
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        res = self._raster((min(xs), min(ys), max(xs), max(ys)), lambda d, T: d.polygon(T(pts), fill=255),
+                           float(op.get("feather", 0.3)))
+        if res is None:
+            return
+        mask, x0, y0 = res
+        ramp = [(float(o), rgba01(c)) for o, c in op.get("ramp", DEFAULT_RAMP)]
+        spec_op = dict(op)
+        if op.get("bounce"):
+            spec_op["bounce"] = [rgba01(op["bounce"][0]), op["bounce"][1]]
+        paint(layer, mask, x0, y0, form_shade(mask, x0, y0, spec_op, ramp, pts), **_paint_opts(op))
 
     def _hatch(self, layer, op, rng):
         region = [tuple(p[:2]) for p in op["region"]]
@@ -320,29 +380,43 @@ def _gradient(op: dict[str, Any], w: int, h: int) -> np.ndarray:
     return out
 
 
-def _layer_key(layer: Layer, w: int, h: int) -> str:
-    return hashlib.sha1(json.dumps([w, h, layer.name, layer.ops], sort_keys=True).encode()).hexdigest()
+def _layer_key(layer: Layer, w: int, h: int, scene: Scene | None = None, _seen: frozenset = frozenset()) -> str:
+    """Content hash of a layer, including any layers it paints from (painterly sources)."""
+    deps = []
+    for op in layer.ops:
+        src = op.get("source")
+        names = [src] if isinstance(src, str) else src if isinstance(src, list) else []
+        for name in names:
+            if scene is None or name in _seen:
+                continue
+            try:
+                dep = scene.layer(name)
+                deps.append([_layer_key(dep, w, h, scene, _seen | {layer.name}), dep.blend, dep.opacity])
+            except SceneError:
+                deps.append(f"missing:{name}")
+    base = str(getattr(scene, "base_dir", ""))
+    return hashlib.sha1(json.dumps([w, h, layer.name, layer.ops, deps, base], sort_keys=True).encode()).hexdigest()
 
 
-def render_layer_array(layer: Layer, w: int, h: int) -> np.ndarray:
+def render_layer_array(layer: Layer, w: int, h: int, scene: Scene | None = None) -> np.ndarray:
     """Render one layer to a premultiplied float array (cached by content)."""
-    key = _layer_key(layer, w, h)
+    key = _layer_key(layer, w, h, scene)
     if key in _CACHE:
         _CACHE.move_to_end(key)
         return _CACHE[key]
-    arr = LayerRenderer(w, h, Paper(w, h)).render(layer)
+    arr = LayerRenderer(w, h, Paper(w, h), scene).render(layer)
     _CACHE[key] = arr
     while len(_CACHE) > _CACHE_SIZE:
         _CACHE.popitem(last=False)
     return arr
 
 
-def render_layer(layer: Layer, w: int, h: int) -> Image.Image:
-    return to_image(render_layer_array(layer, w, h))
+def render_layer(layer: Layer, w: int, h: int, scene: Scene | None = None) -> Image.Image:
+    return to_image(render_layer_array(layer, w, h, scene))
 
 
 def render_layers(scene: Scene) -> list[tuple[Layer, Image.Image]]:
-    return [(layer, render_layer(layer, scene.width, scene.height)) for layer in scene.layers]
+    return [(layer, render_layer(layer, scene.width, scene.height, scene)) for layer in scene.layers]
 
 
 def apply_opacity(img: Image.Image, opacity: float) -> Image.Image:
@@ -360,6 +434,6 @@ def composite(scene: Scene) -> Image.Image:
     out = from_image(background_image(scene))
     for layer in scene.layers:
         if layer.visible:
-            out = composite_over(out, render_layer_array(layer, scene.width, scene.height), layer.blend,
+            out = composite_over(out, render_layer_array(layer, scene.width, scene.height, scene), layer.blend,
                                  layer.opacity)
     return to_image(out)
