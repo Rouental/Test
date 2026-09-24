@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdnart"
+version = "0.1.0"
+description = "Compose layered art in code or via Claude, and open it in paint.net"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["pillow>=10.1"]
+
+[project.optional-dependencies]
+windows = ["pywin32; sys_platform == 'win32'", "pywinauto; sys_platform == 'win32'"]
+mcp = ["mcp"]
+dev = ["pytest"]
+
+[project.scripts]
+pdnart = "pdnart.cli:main"
+
+[tool.setuptools]
+packages = ["pdnart"]

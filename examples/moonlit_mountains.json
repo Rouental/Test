@@ -1,0 +1,42 @@
+{
+  "width": 800,
+  "height": 500,
+  "background": "#0b1033",
+  "layers": [
+    {"name": "Sky", "ops": [
+      {"op": "gradient", "kind": "linear", "x0": 0, "y0": 0, "x1": 0, "y1": 390,
+       "stops": [[0, "#0b1033"], [0.55, "#3b2a6b"], [1, "#f08a5d"]]}
+    ]},
+    {"name": "Stars", "opacity": 0.9, "ops": [
+      {"op": "scatter", "count": 140, "region": [0, 0, 800, 250], "radius": [0.5, 1.6],
+       "colors": ["#ffffff", "#ffe9b0", "#cfd8ff"], "seed": 7},
+      {"op": "scatter", "count": 6, "region": [40, 20, 720, 150], "radius": [3, 5],
+       "colors": ["#fff6d8"], "shape": "star", "seed": 3}
+    ]},
+    {"name": "Moon glow", "opacity": 0.8, "ops": [
+      {"op": "ellipse", "cx": 610, "cy": 115, "rx": 75, "ry": 75, "fill": "#ffe7a8"},
+      {"op": "blur", "radius": 28}
+    ]},
+    {"name": "Moon", "ops": [
+      {"op": "ellipse", "cx": 610, "cy": 115, "rx": 38, "ry": 38, "fill": "#fff6d8"},
+      {"op": "ellipse", "cx": 598, "cy": 105, "rx": 8, "ry": 7, "fill": "#efe1b8"},
+      {"op": "ellipse", "cx": 624, "cy": 128, "rx": 5, "ry": 5, "fill": "#efe1b8"}
+    ]},
+    {"name": "Far mountains", "ops": [
+      {"op": "polygon", "fill": "#3a2c63", "points": [[0, 330], [90, 250], [170, 300], [260, 210], [360, 290],
+        [450, 230], [540, 300], [640, 240], [720, 290], [800, 260], [800, 390], [0, 390]]}
+    ]},
+    {"name": "Near mountains", "ops": [
+      {"op": "polygon", "fill": "#1a1333", "points": [[0, 360], [120, 290], [210, 350], [330, 270], [430, 355],
+        [560, 300], [680, 365], [800, 320], [800, 390], [0, 390]]}
+    ]},
+    {"name": "Lake", "ops": [
+      {"op": "gradient", "kind": "linear", "x0": 0, "y0": 390, "x1": 0, "y1": 500,
+       "stops": [[0, "#00000000"], [0.001, "#2a1f4d"], [1, "#0d0a1f"]]},
+      {"op": "stroke", "points": [[560, 405], [610, 403], [660, 406]], "color": "#ffe7a8cc", "width": 3},
+      {"op": "stroke", "points": [[575, 420], [612, 418], [645, 421]], "color": "#ffe7a899", "width": 2.5},
+      {"op": "stroke", "points": [[588, 437], [614, 435], [634, 438]], "color": "#ffe7a866", "width": 2},
+      {"op": "stroke", "points": [[598, 455], [622, 456]], "color": "#ffe7a844", "width": 2}
+    ]}
+  ]
+}
