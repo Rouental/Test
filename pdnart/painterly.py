@@ -41,6 +41,7 @@ def repaint(layer: np.ndarray, source: np.ndarray, op: dict[str, Any], rng: np.r
     threshold = float(op.get("threshold", 0.06))
     min_len, max_len = op.get("length", [2, 10])
     curve = float(op.get("curvature", 0.75))
+    flow_ref = float(op.get("flow_threshold", 0.02))  # luminance gradient (per px) that counts as a real edge
     fixed_angle = op.get("angle")
     color_jitter = float(op.get("color_jitter", 0.025))
     opacity = float(op.get("opacity", 1.0))
@@ -57,9 +58,17 @@ def repaint(layer: np.ndarray, source: np.ndarray, op: dict[str, Any], rng: np.r
         R = D / 2
         ref_p = gblur(source, blur_factor * R) if blur_factor * R >= 0.3 else source
         ref = _straight(ref_p)
+        # Stroke direction field from the smoothed structure tensor: strokes run along edges, and the
+        # field is coherent (no swirling after noise) because the tensor is averaged over the brush.
         lum = gblur(ref @ np.array([0.3, 0.59, 0.11], np.float32), max(1.0, R * 0.5))
         gy, gx = np.gradient(lum)
-        gmag = np.hypot(gx, gy)
+        jxx, jxy, jyy = (gblur(v, max(1.0, R)) for v in (gx * gx, gx * gy, gy * gy))
+        # Add the tensor at a much wider scale: where there is no local structure (flat sky, background),
+        # strokes inherit the direction of the surrounding forms instead of the orientation of noise.
+        jxx, jxy, jyy = (v + gblur(v, max(4.0, 6 * R)) for v in (jxx, jxy, jyy))
+        theta = 0.5 * np.arctan2(2 * jxy, jxx - jyy)  # dominant gradient orientation
+        flow_x, flow_y = -np.sin(theta), np.cos(theta)  # perpendicular: along the edge
+        strength = np.clip(np.sqrt(np.sqrt((jxx - jyy) ** 2 + 4 * jxy ** 2)) / flow_ref, 0, 1)
 
         # Compare at the scale of this brush: brush texture (bristle streaks, colour jitter) is not error.
         canvas = _straight(gblur(layer, 0.5 * R) if R >= 1 else layer)
@@ -99,19 +108,13 @@ def repaint(layer: np.ndarray, source: np.ndarray, op: dict[str, Any], rng: np.r
                 if fixed_angle is not None:
                     ndx, ndy = np.cos(np.radians(fixed_angle)), np.sin(np.radians(fixed_angle))
                 else:
-                    gm = float(gmag[cy, cx])
-                    if gm < 1e-4:
-                        if i == 0:
-                            ang = rng.uniform(0, 2 * np.pi)
-                            ndx, ndy = np.cos(ang), np.sin(ang)
-                        else:
-                            ndx, ndy = dx, dy
-                    else:
-                        ndx, ndy = -float(gy[cy, cx]) / gm, float(gx[cy, cx]) / gm
+                    ndx, ndy = float(flow_x[cy, cx]), float(flow_y[cy, cx])
                 if dx * ndx + dy * ndy < 0:
                     ndx, ndy = -ndx, -ndy
                 if i > 0:
-                    ndx, ndy = curve * ndx + (1 - curve) * dx, curve * ndy + (1 - curve) * dy
+                    # Follow the field firmly along real edges; where there is no structure, carry on straight.
+                    k = curve * float(strength[cy, cx]) if fixed_angle is None else curve
+                    ndx, ndy = k * ndx + (1 - k) * dx, k * ndy + (1 - k) * dy
                 norm = np.hypot(ndx, ndy) or 1
                 dx, dy = ndx / norm, ndy / norm
                 x, y = x + R * dx, y + R * dy

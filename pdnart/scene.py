@@ -48,6 +48,7 @@ OP_SPECS: dict[str, tuple[set[str], set[str]]] = {
                                    "shine", "shine_size", "feather"}),
     "copy": ({"source"}, COMMON),
     "painterly": ({"source"}, COMMON | BRUSH_PARAMS | {"brush", "sizes", "threshold", "length", "curvature",
+                                                        "flow_threshold",
                                                         "angle", "color_jitter", "grid", "blur", "region", "seed"}),
     "fill": ({"color"}, COMMON),
 }

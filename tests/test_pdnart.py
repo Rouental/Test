@@ -262,3 +262,22 @@ def test_mcp_tools_build_and_preview():
         mcp_server.set_layer("sun", blend="sparkle")
     assert "oil" in mcp_server.op_reference()["brushes"]
     json.dumps(mcp_server.op_reference())
+
+
+def test_cli_paint_repaints_a_photo(tmp_path):
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (120, 80), "#203050")
+    ImageDraw.Draw(img).ellipse([30, 10, 90, 70], fill="#e0a060")
+    img.save(tmp_path / "photo.png")
+    cli_main(["paint", str(tmp_path / "photo.png"), "-o", str(tmp_path / "out.png"), "--detail", "low",
+              "--scene", str(tmp_path / "scene.json")])
+    out = Image.open(tmp_path / "out.png").convert("RGB")
+    assert out.size == (120, 80)
+    from PIL import ImageStat
+
+    r, g, b = ImageStat.Stat(out.crop((45, 25, 75, 55))).mean
+    assert r > 170 and b < 130, (r, g, b)  # the orange disc was painted
+    r, g, b = ImageStat.Stat(out.crop((0, 0, 15, 80))).mean
+    assert b > r, (r, g, b)  # the blue background too
+    assert Scene.load(tmp_path / "scene.json").layers[0].ops[0]["op"] == "painterly"

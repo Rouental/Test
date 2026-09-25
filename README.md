@@ -76,6 +76,13 @@ pdnart render examples/portrait.json -o art.png --layers layers/          # any 
 pdnart send   examples/portrait.json --save C:\art\portrait.pdn             # Windows + paint.net
 ```
 
+Paint any photo or picture as an oil painting, and optionally open it in paint.net:
+
+```bash
+pdnart paint photo.jpg -o painting.png --width 1000              # --detail low|medium|high, --brush oil|dry|...
+pdnart paint photo.jpg --send --save C:\art\painting.pdn         # Windows + paint.net
+```
+
 If paint.net is slow on your machine and steps get skipped, increase `--delay` (seconds between
 UI steps, default 0.6).
 
