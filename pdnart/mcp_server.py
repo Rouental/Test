@@ -161,6 +161,29 @@ def save_files(path: str) -> str:
 
 
 @server.tool()
+def stylize_photo(path: str, style_profile: str | None = None, output: str | None = None,
+                  focus: list[int] | None = None) -> MCPImage:
+    """Turn a photo or artwork into a semi-realistic digital painting (painted planes, idealised skin,
+    crisp eyes, painted background, line accents). style_profile = a JSON profile made with
+    `pdnart style-profile` from reference paintings, to borrow their colour character. focus =
+    [x, y, w, h] of the subject to keep sharp (faces are detected automatically). The result becomes
+    the current scene (a colour layer plus a line-accent layer), ready for send_to_paintnet."""
+    from pathlib import Path
+
+    from .cli import stylize_to_files
+
+    profile = json.loads(Path(style_profile).read_text()) if style_profile else None
+    out = output or str(Path(path).with_name(Path(path).stem + "_stylized.png"))
+    result, scene = stylize_to_files(path, out, profile, focus=tuple(focus) if focus else None)
+    _state["scene"] = scene
+    img = result.painting.copy()
+    img.thumbnail((800, 800))
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return MCPImage(data=buf.getvalue(), format="png")
+
+
+@server.tool()
 def send_to_paintnet(save_pdn: str | None = None) -> str:
     """Open the scene in paint.net (launching it if needed) as a layered document. Windows only.
     Optionally save it as a .pdn file. Keep hands off the mouse/keyboard while this runs."""

@@ -13,6 +13,7 @@ dependencies = ["pillow>=10.1", "numpy>=1.25"]
 [project.optional-dependencies]
 windows = ["pywin32; sys_platform == 'win32'", "pywinauto; sys_platform == 'win32'"]
 mcp = ["mcp"]
+stylize = ["opencv-python-headless<5"]  # face detection and edge-aware filters for `pdnart stylize`
 dev = ["pytest"]
 
 [project.scripts]

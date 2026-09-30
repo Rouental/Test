@@ -74,6 +74,62 @@ def cmd_paint(args: argparse.Namespace) -> None:
         print("sent to paint.net")
 
 
+def cmd_style_profile(args: argparse.Namespace) -> None:
+    import json
+
+    from .stylize import make_profile
+
+    profile = make_profile(args.references)
+    Path(args.output).write_text(json.dumps(profile, indent=2))
+    print(f"wrote {args.output} from {len(args.references)} reference(s)")
+
+
+def stylize_to_files(photo: str, output: str, profile: dict | None = None, **overrides):
+    """Stylize `photo`; write the painting plus its layers (base colour, line accents) next to it.
+    Returns (Stylized result, a layered Scene referencing the layer files)."""
+    from PIL import Image
+
+    from .stylize import StyleOptions, options_from_profile, stylize
+
+    overrides = {k: v for k, v in overrides.items() if v is not None}
+    opts = options_from_profile(profile, **overrides) if profile else StyleOptions(**overrides)
+    with Image.open(photo) as im:
+        result = stylize(im, opts)
+    out = Path(output)
+    base_path = out.with_name(out.stem + "_base.png")
+    lines_path = out.with_name(out.stem + "_lines.png")
+    result.painting.save(out)
+    result.base.save(base_path)
+    result.lines.save(lines_path)
+    w, h = result.painting.size
+    scene = Scene.from_dict({"width": w, "height": h, "background": "#000000", "layers": [
+        {"name": "Painting", "ops": [{"op": "image", "path": str(base_path.resolve())}]},
+        {"name": "Line accents", "ops": [{"op": "image", "path": str(lines_path.resolve())}]},
+    ]})
+    return result, scene
+
+
+def cmd_stylize(args: argparse.Namespace) -> None:
+    import json
+
+    profile = json.loads(Path(args.style).read_text()) if args.style else None
+    if args.refs:
+        from .stylize import make_profile
+
+        profile = make_profile(args.refs)
+    focus = tuple(int(v) for v in args.focus.split(",")) if args.focus else None
+    result, scene = stylize_to_files(
+        args.photo, args.output, profile, focus=focus, max_size=args.max_size, skin_smoothing=args.skin,
+        brushwork=args.brushwork, lines=args.lines, color_strength=args.color)
+    print(f"wrote {args.output} (+ _base.png, _lines.png); faces: {result.faces or 'none found'}")
+    if args.send:
+        from .paintnet import PaintDotNet
+
+        for warning in PaintDotNet().send_scene(scene, args.save):
+            print("warning:", warning)
+        print("sent to paint.net")
+
+
 def cmd_mcp(_: argparse.Namespace) -> None:
     from .mcp_server import main
 
@@ -107,6 +163,26 @@ def main(argv: list[str] | None = None) -> None:
     pp.add_argument("--send", action="store_true", help="open the painting in paint.net (Windows)")
     pp.add_argument("--save", metavar="FILE.pdn", help="with --send, save it as a .pdn file")
     pp.set_defaults(func=cmd_paint)
+
+    sp = sub.add_parser("style-profile", help="save a reusable style profile from reference paintings")
+    sp.add_argument("references", nargs="+", help="paintings in the style you want (e.g. your commissions)")
+    sp.add_argument("-o", "--output", default="style.json")
+    sp.set_defaults(func=cmd_style_profile)
+
+    st = sub.add_parser("stylize", help="turn a photo or artwork into a semi-realistic digital painting")
+    st.add_argument("photo")
+    st.add_argument("-o", "--output", default="stylized.png")
+    st.add_argument("--style", metavar="PROFILE.json", help="a profile made with `pdnart style-profile`")
+    st.add_argument("--refs", nargs="+", metavar="IMG", help="reference paintings (instead of a profile)")
+    st.add_argument("--focus", metavar="X,Y,W,H", help="the face / subject to keep sharp (default: detect faces)")
+    st.add_argument("--max-size", type=int, help="working resolution, long side (default 1400)")
+    st.add_argument("--skin", type=float, help="skin smoothing 0..1 (default 0.7)")
+    st.add_argument("--brushwork", type=float, help="visible brush strokes 0..1 (default 0.7)")
+    st.add_argument("--lines", type=float, help="line accents 0..1 (default 0.4)")
+    st.add_argument("--color", type=float, help="how strongly to adopt the style's colour 0..1 (default 0.55)")
+    st.add_argument("--send", action="store_true", help="open the result in paint.net as layers (Windows)")
+    st.add_argument("--save", metavar="FILE.pdn", help="with --send, save it as a .pdn file")
+    st.set_defaults(func=cmd_stylize)
 
     m = sub.add_parser("mcp", help="run the MCP server over stdio (for Claude Desktop / Claude Code)")
     m.set_defaults(func=cmd_mcp)

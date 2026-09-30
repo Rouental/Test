@@ -83,6 +83,39 @@ pdnart paint photo.jpg -o painting.png --width 1000              # --detail low|
 pdnart paint photo.jpg --send --save C:\art\painting.pdn         # Windows + paint.net
 ```
 
+### Digital-painting style (`stylize`)
+
+Turn a photo or another artwork into a semi-realistic digital painting, borrowing the colour
+character of paintings you like:
+
+```bash
+pip install -e ".[stylize]"                                        # adds OpenCV for face detection
+pdnart style-profile my_commissions/*.jpg -o mystyle.json         # once: learn the palette character
+pdnart stylize photo.jpg --style mystyle.json -o painted.png       # writes painted.png (+ _base, _lines layers)
+pdnart stylize photo.jpg --style mystyle.json --send --save C:\art\painted.pdn   # open in paint.net
+```
+
+What it does:
+- **Anisotropic Kuwahara filter:** flattens photo texture into painted planes that follow the
+  forms, and keeps edges crisp.
+- **Face-aware detail:** faces are detected, or given with `--focus x,y,w,h`. They keep sharp
+  eyes, brows and lips, and the skin is idealised the way a retoucher would, with edge-aware
+  frequency separation.
+- **Busy areas keep their detail:** architecture and ornament stay detailed, while big areas are
+  painted broadly and the background softens.
+- **Colour character from your profile:** it takes the profile's contrast and vibrancy while
+  keeping the scene's own hues. On top of that it warms the lights, cools the shadows, and warms
+  the half-tones of skin.
+- **Brushwork and highlights:** brush strokes are added with the painterly engine, and small
+  highlights (stars, catchlights) are restored.
+- **Line accents:** on their own layer.
+
+Tune the result with `--skin`, `--brushwork`, `--lines` and `--color` (all 0 to 1). It runs in
+roughly 10 seconds to 1.5 minutes per image, depending on size.
+
+It is a filter pipeline, not a trained model. It gives photos a painted look in the same family as
+your references, but it doesn't redraw anatomy or invent details the way an illustrator would.
+
 If paint.net is slow on your machine and steps get skipped, increase `--delay` (seconds between
 UI steps, default 0.6).
 
@@ -113,6 +146,7 @@ Claude checks its progress with `preview` as it goes. Claude gets these tools:
 | `draw`, `undo` | add or remove ops on a layer; `paths` paints many strokes in one op |
 | `preview` | returns the rendered image; `grid=true` labels coordinates and `region=[x,y,w,h]` zooms in on details |
 | `get_scene`, `load_scene`, `save_files` | JSON, PNG and JPG in and out |
+| `stylize_photo` | turns a photo into a digital painting (optionally with a style profile) and loads it as the scene |
 | `send_to_paintnet` | builds the layered document in paint.net, optionally saving a `.pdn` |
 
 Layers are cached, so after Claude changes one layer, only that layer and the layers painted from it

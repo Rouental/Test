@@ -281,3 +281,55 @@ def test_cli_paint_repaints_a_photo(tmp_path):
     r, g, b = ImageStat.Stat(out.crop((0, 0, 15, 80))).mean
     assert b > r, (r, g, b)  # the blue background too
     assert Scene.load(tmp_path / "scene.json").layers[0].ops[0]["op"] == "painterly"
+
+
+def _test_photo(path, size=(160, 120)):
+    import numpy as np
+    from PIL import Image, ImageDraw
+
+    w, h = size
+    img = Image.new("RGB", size, "#3a5a8a")
+    d = ImageDraw.Draw(img)
+    d.ellipse([w * 0.31, h * 0.17, w * 0.69, h * 0.79], fill="#e0b090")  # a face-ish blob
+    d.rectangle([0, h * 0.79, w, h], fill="#2a4a2a")
+    grain = np.random.default_rng(0).normal(0, 12, (h, w, 1))  # photo grain the filter should flatten
+    arr = np.clip(np.asarray(img, np.float32) + grain, 0, 255).astype(np.uint8)
+    Image.fromarray(arr).save(path)
+    return path
+
+
+def test_stylize_paints_planes_and_keeps_colours(tmp_path):
+    from PIL import Image, ImageStat
+
+    from pdnart.stylize import StyleOptions, stylize
+
+    src = Image.open(_test_photo(tmp_path / "p.png", (400, 300)))
+    r = stylize(src, StyleOptions(brushwork=0, texture=0, focus=(125, 50, 150, 187)))
+    assert r.painting.size == src.size and r.lines.mode == "RGBA"
+    face = ImageStat.Stat(r.painting.crop((180, 120, 220, 170))).mean
+    assert face[0] > face[2] + 30  # the face stays warm
+    # grain in the flat background is flattened into a painted plane
+    before = ImageStat.Stat(src.crop((10, 10, 90, 60)).convert("L")).stddev[0]
+    after = ImageStat.Stat(r.base.crop((10, 10, 90, 60)).convert("L")).stddev[0]
+    assert after < before / 2, (before, after)
+
+
+def test_style_profile_and_cli_stylize(tmp_path):
+    import json
+
+    from PIL import Image
+
+    from pdnart.stylize import make_profile
+
+    ref = tmp_path / "ref.png"
+    Image.new("RGB", (40, 40), "#a05080").save(ref)
+    profile = make_profile([ref], saturation=1.2)
+    assert len(profile["lab_mean"]) == 3 and profile["options"] == {"saturation": 1.2}
+    with pytest.raises(ValueError):
+        make_profile([ref], sparkle=1)
+    (tmp_path / "style.json").write_text(json.dumps(profile))
+    photo = _test_photo(tmp_path / "p.png")
+    cli_main(["stylize", str(photo), "--style", str(tmp_path / "style.json"), "-o", str(tmp_path / "out.png"),
+              "--brushwork", "0.3", "--focus", "50,20,60,75"])
+    for name in ("out.png", "out_base.png", "out_lines.png"):
+        assert (tmp_path / name).exists()
