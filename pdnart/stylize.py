@@ -36,6 +36,7 @@ except ImportError:  # pragma: no cover - exercised only without OpenCV
 @dataclass
 class StyleOptions:
     max_size: int = 1400             # working resolution (long side, px)
+    min_size: int = 1000             # small images are upscaled to this first: cleaner, finer strokes
     face_radius: float = 4.0         # Kuwahara radius on faces, at 1200 px
     background_radius: float = 10.0  # Kuwahara radius elsewhere, at 1200 px
     sharpness: float = 8.0           # Kuwahara q: higher = crisper plane boundaries
@@ -50,7 +51,7 @@ class StyleOptions:
     skin_warmth: float = 0.6         # saturated warm transition on skin shadows (subsurface glow)
     highlights: float = 1.0          # restore small bright points: stars, glints, catchlights
     brushwork: float = 0.7           # visible brush strokes outside the face (pdnart painterly pass)
-    texture: float = 0.05            # brush texture strength
+    texture: float = 0.04            # brush texture strength
     focus: tuple[int, int, int, int] | None = None  # (x, y, w, h) in input pixels; None = detect faces
     references: Sequence[str] = field(default_factory=tuple)
     palette: tuple[Sequence[float], Sequence[float]] | None = None  # (Lab mean, Lab std), e.g. from a profile
@@ -278,7 +279,9 @@ def stylize(image: Image.Image, opts: StyleOptions | None = None, seed: int = 1)
     opts = opts or StyleOptions()
     img = image.convert("RGB")
     scale_in = min(1.0, opts.max_size / max(img.size))
-    if scale_in < 1:
+    if max(img.size) < opts.min_size:
+        scale_in = opts.min_size / max(img.size)
+    if scale_in != 1:
         img = img.resize((round(img.width * scale_in), round(img.height * scale_in)), Image.LANCZOS)
     rgb = np.asarray(img, np.float32) / 255
     h, w, _ = rgb.shape
@@ -355,7 +358,10 @@ def stylize(image: Image.Image, opts: StyleOptions | None = None, seed: int = 1)
 
     # 5. brush texture, mostly away from the face
     if opts.texture:
-        tex = brush_texture(h, w, tx, ty, max(4, round(6 * unit)), np.random.default_rng(seed))
+        # Texture follows a wide, smooth flow: on plain areas (a wall, sky) the local flow is just noise,
+        # which would turn the streaks into speckle.
+        wtx, wty, _ = structure(gblur(lum, 3 * unit), 14 * unit)
+        tex = brush_texture(h, w, wtx, wty, max(6, round(12 * unit)), np.random.default_rng(seed))
         amount = opts.texture * (1 - 0.7 * focus)
         painted = np.clip(painted * (1 + amount[..., None] * tex[..., None]), 0, 1)
 
