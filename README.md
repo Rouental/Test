@@ -109,8 +109,16 @@ What it does:
 - **Brushwork and highlights:** brush strokes are added with the painterly engine, and small
   highlights (stars, catchlights) are restored.
 - **Line accents:** on their own layer.
+- **Subject separation:** the person is cut out (GrabCut, seeded from the face). The backdrop is then
+  painted softer and hazier, or replaced with an image of your choice (`--background castle.jpg`),
+  which is painted by the same filter so the two belong together.
+- **Dodge and burn:** the big light and shadow shapes of the subject are exaggerated the way a
+  painter does (`--form`), and a soft rim light is added on the shadow side (`--rim`).
+- **Detail matching:** the profile records how much fine versus broad detail the references have,
+  and the result is nudged toward the same balance (`--detail-match`).
 
-Tune the result with `--skin`, `--brushwork`, `--lines` and `--color` (all 0 to 1). It runs in
+Tune the result with `--skin`, `--brushwork`, `--lines`, `--color`, `--form`, `--rim` and
+`--detail-match` (all 0 to 1), and `--background keep|paint|IMAGE`. It runs in
 roughly 10 seconds to 1.5 minutes per image, depending on size.
 
 It is a filter pipeline, not a trained model. It gives photos a painted look in the same family as

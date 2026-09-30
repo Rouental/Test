@@ -49,12 +49,18 @@ class StyleOptions:
     lines: float = 0.4               # opacity of the line-accent layer
     skin_smoothing: float = 0.7      # idealise skin: soften wrinkles and pores, keep features sharp
     skin_warmth: float = 0.6         # saturated warm transition on skin shadows (subsurface glow)
+    form_contrast: float = 0.45      # dodge & burn the big light/shadow shapes of the subject
+    detail_match: float = 0.7        # match the references' amount of detail at each scale (needs a profile)
+    background: str = "paint"        # "keep", "paint" (softer, hazier, more painted) or an image path
+    background_strength: float = 0.55
+    rim_light: float = 0.25          # soft light along the subject's shadow-side edge
     highlights: float = 1.0          # restore small bright points: stars, glints, catchlights
     brushwork: float = 0.7           # visible brush strokes outside the face (pdnart painterly pass)
     texture: float = 0.04            # brush texture strength
     focus: tuple[int, int, int, int] | None = None  # (x, y, w, h) in input pixels; None = detect faces
     references: Sequence[str] = field(default_factory=tuple)
     palette: tuple[Sequence[float], Sequence[float]] | None = None  # (Lab mean, Lab std), e.g. from a profile
+    bands: Sequence[float] | None = None  # the references' detail per scale (see detail_bands)
 
 
 # ------------------------------------------------------------------ colour helpers
@@ -265,6 +271,91 @@ def add_brushwork(rgb: np.ndarray, focus: np.ndarray, amount: float, unit: float
     return rgb + (strokes - rgb) * mix
 
 
+BAND_SIGMAS = (1.0, 2.0, 4.0, 8.0)  # at 1200 px long side
+
+
+def detail_bands(L: np.ndarray, unit: float, mask: np.ndarray | None = None) -> np.ndarray:
+    """Standard deviation of lightness in each band of a difference-of-Gaussians pyramid:
+    how much fine vs broad detail a picture has."""
+    out, prev = [], L
+    for s in BAND_SIGMAS:
+        blurred = gblur(L, s * unit)
+        band = prev - blurred
+        out.append(float(band[mask > 0.5].std() if mask is not None else band.std()))
+        prev = blurred
+    return np.asarray(out, np.float32)
+
+
+def match_bands(L: np.ndarray, ref_bands, unit: float, strength: float) -> np.ndarray:
+    """Rescale each detail band of L toward the references' amount of detail at that scale."""
+    have = detail_bands(L, unit)
+    prev, rebuilt, bands = L, None, []
+    for s in BAND_SIGMAS:
+        blurred = gblur(L if not bands else prev, s * unit)
+        bands.append(prev - blurred)
+        prev = blurred
+    rebuilt = prev
+    for band, h_std, r_std in zip(bands, have, ref_bands):
+        gain = float(np.clip((r_std / max(h_std, 1e-3)) ** 0.5, 0.7, 1.5))
+        rebuilt = rebuilt + band * (1 + strength * (gain - 1))
+    return rebuilt
+
+
+def subject_mask(rgb: np.ndarray, faces, unit: float) -> np.ndarray | None:
+    """Separate the person from the background (GrabCut seeded from the face), feathered."""
+    if cv2 is None or not faces:
+        return None
+    h, w, _ = rgb.shape
+    small = min(1.0, 600 / max(h, w))
+    sw, sh = max(1, round(w * small)), max(1, round(h * small))
+    img = cv2.resize((rgb * 255).astype(np.uint8), (sw, sh), interpolation=cv2.INTER_AREA)
+    mask = np.full((sh, sw), cv2.GC_PR_BGD, np.uint8)
+    for x, y, fw, fh in faces:
+        x, y, fw, fh = (v * small for v in (x, y, fw, fh))
+        # beside the head, above the shoulders: probably background, the far corners certainly
+        top = int(y + 0.9 * fh)
+        cv2.rectangle(mask, (0, 0), (int(x - 0.7 * fw), top), cv2.GC_BGD, -1)
+        cv2.rectangle(mask, (int(x + 1.7 * fw), 0), (sw, top), cv2.GC_BGD, -1)
+        # probably the person: the head, then shoulders widening down to the bottom edge
+        body = np.array([[x - 0.1 * fw, y - 0.55 * fh], [x + 1.1 * fw, y - 0.55 * fh], [x + 1.15 * fw, y + 1.0 * fh],
+                         [x + 1.9 * fw, y + 1.5 * fh], [x + 2.6 * fw, sh], [x - 1.6 * fw, sh],
+                         [x - 0.9 * fw, y + 1.5 * fh], [x - 0.15 * fw, y + 1.0 * fh]], np.int32)
+        cv2.fillPoly(mask, [body], cv2.GC_PR_FGD)
+        # certainly the person: the middle of the face and the neck below it
+        cv2.rectangle(mask, (int(x + 0.2 * fw), int(y + 0.15 * fh)), (int(x + 0.8 * fw), int(y + 1.25 * fh)),
+                      cv2.GC_FGD, -1)
+        cv2.rectangle(mask, (int(x + 0.05 * fw), int(y + 1.25 * fh)), (int(x + 0.95 * fw), sh), cv2.GC_FGD, -1)
+    border = max(2, round(0.01 * max(sw, sh)))
+    mask[:border, :] = np.where(mask[:border, :] == cv2.GC_FGD, cv2.GC_FGD, cv2.GC_BGD)
+    bgd, fgd = np.zeros((1, 65), np.float64), np.zeros((1, 65), np.float64)
+    try:
+        cv2.grabCut(img, mask, None, bgd, fgd, 5, cv2.GC_INIT_WITH_MASK)
+    except cv2.error:
+        return None
+    fg = np.isin(mask, (cv2.GC_FGD, cv2.GC_PR_FGD)).astype(np.uint8)
+    # keep the main connected shape, and fill holes inside it (buttons, badges, dark folds)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(fg, connectivity=8)
+    if n > 1:
+        fg = (labels == 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))).astype(np.uint8)
+    holes = (1 - fg).copy()
+    flood = np.zeros((sh + 2, sw + 2), np.uint8)
+    for sx, sy in ((0, 0), (sw - 1, 0), (0, sh - 1), (sw - 1, sh - 1)):
+        if holes[sy, sx]:
+            cv2.floodFill(holes, flood, (sx, sy), 0)
+    fg = np.maximum(fg, holes).astype(np.float32)  # what the flood from the edges didn't reach is a hole
+    fg = cv2.resize(fg, (w, h), interpolation=cv2.INTER_LINEAR)
+    return np.clip(gblur(fg, 4 * unit), 0, 1)
+
+
+def cover_fit(path: str, w: int, h: int) -> np.ndarray:
+    with Image.open(path) as im:
+        im = im.convert("RGB")
+        scale = max(w / im.width, h / im.height)
+        im = im.resize((max(w, round(im.width * scale)), max(h, round(im.height * scale))), Image.LANCZOS)
+        left, top = (im.width - w) // 2, (im.height - h) // 3
+        return np.asarray(im.crop((left, top, left + w, top + h)), np.float32) / 255
+
+
 # ------------------------------------------------------------------ pipeline
 
 @dataclass
@@ -302,6 +393,16 @@ def stylize(image: Image.Image, opts: StyleOptions | None = None, seed: int = 1)
         if faces:  # drop small false positives next to a clear main face
             faces = [f for f in faces if f[2] * f[3] >= 0.25 * faces[0][2] * faces[0][3]]
     focus = focus_mask(h, w, faces) if faces else np.zeros((h, w), np.float32)
+    face_size = float(np.sqrt(faces[0][2] * faces[0][3])) if faces else 0.25 * max(h, w)
+    subject = subject_mask(rgb, faces, unit) if (opts.background != "keep" or opts.form_contrast
+                                                  or opts.rim_light) else None
+    if subject is not None and opts.background not in ("keep", "paint"):
+        # a new setting behind the person, painted by the same filter so the two belong together
+        backdrop = cover_fit(opts.background, w, h)
+        backdrop = cv2.bilateralFilter(backdrop, 0, 0.06, 2.5 * unit) if cv2 is not None else backdrop
+        den = backdrop + (den - backdrop) * subject[..., None]
+        rgb = backdrop + (rgb - backdrop) * subject[..., None]
+        focus = focus * subject
 
     lum = den @ np.array([0.299, 0.587, 0.114], np.float32)
     tx, ty, aniso = structure(lum, 2.0 * unit)
@@ -319,6 +420,15 @@ def stylize(image: Image.Image, opts: StyleOptions | None = None, seed: int = 1)
         soft = gblur(painted, opts.background_softness * unit)
         painted = soft + (painted - soft) * detail[..., None]
 
+    if subject is not None and opts.background != "keep" and opts.background_strength:
+        # the background recedes: softer, lower in contrast and a little hazier, like a painted backdrop
+        bg = 1 - subject
+        soft = gblur(painted, 2.5 * unit)
+        mean = (soft * bg[..., None]).sum((0, 1)) / max(bg.sum(), 1)
+        hazy = soft + (mean - soft) * 0.2
+        hazy = hazy + (1 - hazy) * 0.05
+        painted = painted + (hazy - painted) * (opts.background_strength * bg)[..., None]
+
     # 3. colour
     palette = opts.palette or (palette_stats(opts.references) if opts.references else None)
     if palette is not None:
@@ -329,6 +439,13 @@ def stylize(image: Image.Image, opts: StyleOptions | None = None, seed: int = 1)
     if opts.clarity:  # local contrast against an edge-preserving base, so dark/light edges don't halo
         base = cv2.bilateralFilter(L.astype(np.float32), 0, 12, 10 * unit) if cv2 is not None else gblur(L, 10 * unit)
         L = L + opts.clarity * (L - base)
+    if opts.form_contrast and subject is not None:
+        # dodge & burn at the scale of the big forms (cheek planes, the shadow side of the face and
+        # body), which painters exaggerate far more than a camera records
+        big = gblur(L, 0.13 * face_size) - gblur(L, 0.5 * face_size)  # planes, not creases
+        L = L + opts.form_contrast * 0.9 * big * subject
+    if opts.detail_match and opts.bands is not None:
+        L = match_bands(L, np.asarray(opts.bands, np.float32), unit, opts.detail_match)
     if opts.key_light and faces:  # lift the lit side of faces toward a brighter, painted high key
         L = L + opts.key_light * 10 * focus * np.clip((L - 35) / 40, 0, 1)
     lab[..., 0] = L
@@ -349,6 +466,17 @@ def stylize(image: Image.Image, opts: StyleOptions | None = None, seed: int = 1)
         lab[..., 2] += 12 * t
     painted = np.clip(lab_to_rgb(lab), 0, 1)
 
+    if opts.rim_light and subject is not None and faces:
+        # which side of the face is lit? the rim goes on the other, shadow side
+        x, y, fw, fh = faces[0]
+        fl = rgb[y:y + fh, x:x + fw] @ np.array([0.299, 0.587, 0.114], np.float32)
+        lit_left = fl[:, : fw // 2].mean() > fl[:, fw // 2:].mean()
+        inner = subject * np.clip(1 - gblur(subject, 5 * unit) * 1.15, 0, 1) * 3
+        side = np.clip((np.arange(w, dtype=np.float32)[None, :] - (x + fw / 2)) / (1.5 * fw), -1, 1)
+        side = np.clip(side if lit_left else -side, 0, 1)
+        rim = np.clip(gblur(inner * side, 2 * unit), 0, 1) * opts.rim_light
+        rim_color = np.array([1.0, 0.93, 0.82], np.float32)
+        painted = painted + (rim_color - painted) * rim[..., None]
     if opts.brushwork:
         painted = add_brushwork(painted, detail, opts.brushwork, unit, seed)
     if opts.highlights:  # small bright points (stars, glints, catchlights) the filter flattened
@@ -385,14 +513,22 @@ def stylize(image: Image.Image, opts: StyleOptions | None = None, seed: int = 1)
 def make_profile(references: Sequence[str | Path], **option_overrides) -> dict:
     """A reusable style profile: the references' palette statistics plus any option overrides."""
     mean, std = palette_stats(references)
-    known = {f for f in StyleOptions.__dataclass_fields__} - {"references", "palette", "focus"}
+    bands = []
+    for r in references:
+        with Image.open(r) as im:
+            im = im.convert("RGB")
+            im.thumbnail((1200, 1200))
+            L = rgb_to_lab(np.asarray(im, np.float32) / 255)[..., 0]
+            bands.append(detail_bands(L, max(L.shape) / 1200))
+    known = {f for f in StyleOptions.__dataclass_fields__} - {"references", "palette", "focus", "bands"}
     bad = set(option_overrides) - known
     if bad:
         raise ValueError(f"unknown style options: {sorted(bad)}")
     return {"lab_mean": [round(float(v), 3) for v in mean], "lab_std": [round(float(v), 3) for v in std],
+            "detail_bands": [round(float(v), 3) for v in np.mean(bands, axis=0)],
             "references": [Path(r).name for r in references], "options": option_overrides}
 
 
 def options_from_profile(profile: dict, **overrides) -> StyleOptions:
     opts = {**profile.get("options", {}), **{k: v for k, v in overrides.items() if v is not None}}
-    return StyleOptions(palette=(profile["lab_mean"], profile["lab_std"]), **opts)
+    return StyleOptions(palette=(profile["lab_mean"], profile["lab_std"]), bands=profile.get("detail_bands"), **opts)

@@ -121,7 +121,8 @@ def cmd_stylize(args: argparse.Namespace) -> None:
     result, scene = stylize_to_files(
         args.photo, args.output, profile, focus=focus, max_size=args.max_size, min_size=args.min_size,
         skin_smoothing=args.skin,
-        brushwork=args.brushwork, lines=args.lines, color_strength=args.color)
+        brushwork=args.brushwork, lines=args.lines, color_strength=args.color, form_contrast=args.form,
+        background=args.background, rim_light=args.rim, detail_match=args.detail_match)
     print(f"wrote {args.output} (+ _base.png, _lines.png); faces: {result.faces or 'none found'}")
     if args.send:
         from .paintnet import PaintDotNet
@@ -183,6 +184,11 @@ def main(argv: list[str] | None = None) -> None:
     st.add_argument("--brushwork", type=float, help="visible brush strokes 0..1 (default 0.7)")
     st.add_argument("--lines", type=float, help="line accents 0..1 (default 0.4)")
     st.add_argument("--color", type=float, help="how strongly to adopt the style's colour 0..1 (default 0.55)")
+    st.add_argument("--form", type=float, help="dodge & burn the big light/shadow shapes 0..1 (default 0.45)")
+    st.add_argument("--background", help="keep | paint (softer, hazier backdrop; default) | an image to put "
+                    "behind the person")
+    st.add_argument("--rim", type=float, help="rim light on the subject's shadow side 0..1 (default 0.25)")
+    st.add_argument("--detail-match", type=float, help="match the profile's detail per scale 0..1 (default 0.7)")
     st.add_argument("--send", action="store_true", help="open the result in paint.net as layers (Windows)")
     st.add_argument("--save", metavar="FILE.pdn", help="with --send, save it as a .pdn file")
     st.set_defaults(func=cmd_stylize)

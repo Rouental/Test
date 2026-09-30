@@ -335,3 +335,27 @@ def test_style_profile_and_cli_stylize(tmp_path):
         assert (tmp_path / name).exists()
     # small inputs are upscaled to the minimum working size, keeping the aspect ratio
     assert Image.open(tmp_path / "out.png").size == (320, 240)
+
+
+def test_stylize_background_replacement_and_bands(tmp_path):
+    import numpy as np
+    from PIL import Image, ImageStat
+
+    from pdnart.stylize import StyleOptions, detail_bands, match_bands, stylize
+
+    # detail matching moves each band toward the target amount of detail
+    rng = np.random.default_rng(0)
+    L = (rng.random((200, 200)) * 60 + 20).astype(np.float32)
+    target = detail_bands(L, 1.0) * 0.5
+    after = detail_bands(match_bands(L, target, 1.0, 1.0), 1.0)
+    assert (after < detail_bands(L, 1.0)).all()
+
+    # a replacement background shows where the person isn't
+    Image.new("RGB", (400, 300), "#20c040").save(tmp_path / "bg.png")
+    src = Image.open(_test_photo(tmp_path / "p.png", (400, 300)))
+    r = stylize(src, StyleOptions(brushwork=0, texture=0, min_size=0, focus=(125, 50, 150, 187),
+                                  background=str(tmp_path / "bg.png"), bands=[2.0, 2.0, 2.0, 2.0]))
+    corner = ImageStat.Stat(r.painting.crop((5, 5, 60, 40))).mean
+    assert corner[1] > corner[0] + 40 and corner[1] > corner[2] + 40, corner  # green backdrop
+    face = ImageStat.Stat(r.painting.crop((180, 120, 220, 170))).mean
+    assert face[0] > face[1], face  # the face is still the face
