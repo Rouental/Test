@@ -304,7 +304,7 @@ def test_stylize_paints_planes_and_keeps_colours(tmp_path):
     from pdnart.stylize import StyleOptions, stylize
 
     src = Image.open(_test_photo(tmp_path / "p.png", (400, 300)))
-    r = stylize(src, StyleOptions(brushwork=0, texture=0, focus=(125, 50, 150, 187)))
+    r = stylize(src, StyleOptions(brushwork=0, texture=0, min_size=0, focus=(125, 50, 150, 187)))
     assert r.painting.size == src.size and r.lines.mode == "RGBA"
     face = ImageStat.Stat(r.painting.crop((180, 120, 220, 170))).mean
     assert face[0] > face[2] + 30  # the face stays warm
@@ -330,6 +330,8 @@ def test_style_profile_and_cli_stylize(tmp_path):
     (tmp_path / "style.json").write_text(json.dumps(profile))
     photo = _test_photo(tmp_path / "p.png")
     cli_main(["stylize", str(photo), "--style", str(tmp_path / "style.json"), "-o", str(tmp_path / "out.png"),
-              "--brushwork", "0.3", "--focus", "50,20,60,75"])
+              "--brushwork", "0.3", "--focus", "50,20,60,75", "--min-size", "320"])
     for name in ("out.png", "out_base.png", "out_lines.png"):
         assert (tmp_path / name).exists()
+    # small inputs are upscaled to the minimum working size, keeping the aspect ratio
+    assert Image.open(tmp_path / "out.png").size == (320, 240)

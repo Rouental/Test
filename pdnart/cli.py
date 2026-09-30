@@ -119,7 +119,8 @@ def cmd_stylize(args: argparse.Namespace) -> None:
         profile = make_profile(args.refs)
     focus = tuple(int(v) for v in args.focus.split(",")) if args.focus else None
     result, scene = stylize_to_files(
-        args.photo, args.output, profile, focus=focus, max_size=args.max_size, skin_smoothing=args.skin,
+        args.photo, args.output, profile, focus=focus, max_size=args.max_size, min_size=args.min_size,
+        skin_smoothing=args.skin,
         brushwork=args.brushwork, lines=args.lines, color_strength=args.color)
     print(f"wrote {args.output} (+ _base.png, _lines.png); faces: {result.faces or 'none found'}")
     if args.send:
@@ -176,6 +177,8 @@ def main(argv: list[str] | None = None) -> None:
     st.add_argument("--refs", nargs="+", metavar="IMG", help="reference paintings (instead of a profile)")
     st.add_argument("--focus", metavar="X,Y,W,H", help="the face / subject to keep sharp (default: detect faces)")
     st.add_argument("--max-size", type=int, help="working resolution, long side (default 1400)")
+    st.add_argument("--min-size", type=int, help="upscale smaller images to this long side first (default 1000, "
+                    "0 = never); the painting is written at the working resolution")
     st.add_argument("--skin", type=float, help="skin smoothing 0..1 (default 0.7)")
     st.add_argument("--brushwork", type=float, help="visible brush strokes 0..1 (default 0.7)")
     st.add_argument("--lines", type=float, help="line accents 0..1 (default 0.4)")
